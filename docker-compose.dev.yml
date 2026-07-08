@@ -1,5 +1,13 @@
 services:
   beeperbox:
-    build: .
+    build:
+      context: .
+      # Pin the Beeper Desktop AppImage for a reproducible, integrity-checked
+      # build (Dockerfile enforces `sha256sum -c` when the hash is supplied).
+      # Bump both together when deliberately upgrading Beeper; leave them and
+      # the upstream default (empty args) tracks rolling stable.
+      args:
+        BEEPER_VERSION: "4.2.957"
+        BEEPER_SHA256: "5850bc5af206e24130ec7614bb62db7e67e5203d9fc6d6010c19ccf9b4656a45"
     image: beeperbox:dev
     pull_policy: never
