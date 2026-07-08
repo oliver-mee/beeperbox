@@ -13,10 +13,11 @@ set -u
 IMAGE="${1:?usage: mcp-guard-check.sh <image_ref>}"
 OPEN=mcp-guard-open
 AUTH=mcp-guard-auth
+RO=mcp-guard-ro
 fail=0
 
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
-cleanup() { docker rm -f "$OPEN" "$AUTH" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$OPEN" "$AUTH" "$RO" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 chk() { # desc expected actual
@@ -41,7 +42,7 @@ names=$(curl -s -X POST "$U" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name')
 for t in list_accounts list_inbox list_unread get_chat read_chat \
          search_messages send_message note_to_self react_to_message archive_chat \
-         poll_messages; do
+         poll_messages download_asset; do
   if echo "$names" | grep -qx "$t"; then echo "PASS: tool $t present"; else echo "FAIL: tool $t missing"; fail=1; fi
 done
 
@@ -69,6 +70,28 @@ chk "wrong token -> 401" 401 \
   "$(code -X POST "$A" -H 'Authorization: Bearer nope' -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')"
 chk "correct token -> 200" 200 \
   "$(code -X POST "$A" -H 'Authorization: Bearer ci-secret' -d '{"jsonrpc":"2.0","id":3,"method":"tools/list"}')"
+
+# ── read-only mode (MCP_READ_ONLY=1) ──────────────────────────────
+# The 4 mutating verbs must be hidden from tools/list AND rejected in
+# tools/call even if a client hardcodes the name; the 8 reads stay available.
+docker run -d --name "$RO" -p 23377:23375 -e MCP_READ_ONLY=1 \
+  --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
+wait_ready http://127.0.0.1:23377 \
+  || { echo "FAIL: read-only server never became ready"; docker logs "$RO"; exit 1; }
+R=http://127.0.0.1:23377
+
+ro_names=$(curl -s -X POST "$R" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name')
+for t in send_message note_to_self react_to_message archive_chat; do
+  if echo "$ro_names" | grep -qx "$t"; then echo "FAIL: write tool $t exposed in read-only mode"; fail=1; else echo "PASS: write tool $t hidden"; fi
+done
+for t in list_accounts list_inbox list_unread get_chat read_chat \
+         search_messages poll_messages download_asset; do
+  if echo "$ro_names" | grep -qx "$t"; then echo "PASS: read tool $t present in read-only mode"; else echo "FAIL: read tool $t missing in read-only mode"; fail=1; fi
+done
+ro_err=$(curl -s -X POST "$R" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{}}}' | jq -r '.error.code // empty')
+chk "read-only send_message tools/call -> rejected (-32601)" "-32601" "${ro_err:-none}"
 
 if [ "$fail" -eq 0 ]; then echo "=== MCP GUARD CHECK PASSED ==="; else echo "=== MCP GUARD CHECK FAILED ==="; fi
 exit "$fail"

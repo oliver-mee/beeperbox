@@ -58,6 +58,19 @@ const MCP_ALLOWED_HOSTS = new Set(
 );
 const MCP_MAX_BODY = parseInt(process.env.MCP_MAX_BODY || String(1024 * 1024), 10);
 
+// ─── read-only mode ───────────────────────────────────────────────
+// MCP_READ_ONLY=1 hides the 4 mutating tools from tools/list AND rejects them
+// in callTool, so a client that hardcodes a name still can't mutate. This is a
+// per-tool CAPABILITY gate, orthogonal to the per-request AUTH gate above — it
+// runs in the transport-agnostic request path (below), so it covers stdio too,
+// not just HTTP. Lets most agents run against a read-only instance while a
+// separate write-capable instance (own port + token) is reserved for the few
+// that must send. WRITE_TOOLS = exactly the handlers that issue a POST.
+const READ_ONLY = /^(1|true)$/i.test(process.env.MCP_READ_ONLY || '');
+const WRITE_TOOLS = new Set([
+  'send_message', 'note_to_self', 'react_to_message', 'archive_chat',
+]);
+
 // Echo-guard id resolution. A send returns a `pendingMessageID`, but Beeper
 // swaps it for the real bridge id once the message is acked — so the id we'd
 // record at send time never matches the id the same message reappears under in
@@ -882,6 +895,12 @@ const TOOLS = [
 ];
 
 async function callTool(name, args) {
+  // Capability gate: in read-only mode the mutating tools are rejected even if a
+  // client hardcodes the name (they're also hidden from tools/list). Thrown
+  // before the switch so it applies uniformly across HTTP and stdio transports.
+  if (READ_ONLY && WRITE_TOOLS.has(name)) {
+    throw rpcError(-32601, `read-only mode: ${name} is disabled`);
+  }
   switch (name) {
     case 'list_accounts': {
       const list = accountList(await beeperFetch('/v1/accounts'));
@@ -1183,7 +1202,7 @@ async function handleRequest(req) {
         return null;
 
       case 'tools/list':
-        result = { tools: TOOLS };
+        result = { tools: READ_ONLY ? TOOLS.filter((t) => !WRITE_TOOLS.has(t.name)) : TOOLS };
         break;
 
       case 'tools/call': {
@@ -1289,6 +1308,7 @@ function startHttpTransport() {
     console.log(`[beeperbox-mcp] beeper api: ${BEEPER_API}`);
     console.log(`[beeperbox-mcp] beeper token: ${BEEPER_TOKEN ? 'set' : 'NOT SET (set BEEPER_TOKEN env var)'}`);
     console.log(`[beeperbox-mcp] http auth: ${MCP_AUTH_TOKEN ? 'required (MCP_AUTH_TOKEN set)' : 'OPEN — set MCP_AUTH_TOKEN to require a bearer token'}`);
+    console.log(`[beeperbox-mcp] mode: ${READ_ONLY ? 'READ-ONLY (' + WRITE_TOOLS.size + ' write tools disabled)' : 'read-write (all tools enabled)'}`);
     console.log(`[beeperbox-mcp] allowed hosts: ${[...MCP_ALLOWED_HOSTS].join(', ')}`);
     preflight();
   });
@@ -1355,6 +1375,11 @@ module.exports = {
   // version + tool names here is what guarantees the two builds can't drift.
   VERSION,
   TOOL_NAMES: TOOLS.map((t) => t.name),
+  // Read-only surface: the write set (hidden + rejected when MCP_READ_ONLY=1)
+  // and the tool names that remain. Exported so the parity test pins them
+  // without a module reload (READ_ONLY itself is fixed at load from env).
+  WRITE_TOOL_NAMES: [...WRITE_TOOLS],
+  READ_TOOL_NAMES: TOOLS.map((t) => t.name).filter((n) => !WRITE_TOOLS.has(n)),
   BIND_ADDR,
   ledgerPath,
   encodeCursor,

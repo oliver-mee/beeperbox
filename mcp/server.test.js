@@ -421,6 +421,27 @@ test('the tool registry is exactly the 12 documented verbs', () => {
   assert.deepEqual([...S.TOOL_NAMES].sort(), expected);
 });
 
+// ── read-only surface (MCP_READ_ONLY=1) ───────────────────────────
+// The write set is exactly the 4 mutating verbs (the POST handlers). In
+// read-only mode those are hidden from tools/list AND rejected in callTool, so
+// the surface most agents see is precisely the 8 reads. Pin both here; the
+// runtime filter/reject behaviour is exercised end-to-end in
+// scripts/mcp-guard-check.sh's read-only boot mode.
+test('the write set is exactly the 4 mutating verbs', () => {
+  assert.deepEqual(
+    [...S.WRITE_TOOL_NAMES].sort(),
+    ['archive_chat', 'note_to_self', 'react_to_message', 'send_message'],
+  );
+});
+
+test('the read-only surface is exactly the 8 read verbs', () => {
+  const expected = [
+    'list_accounts', 'list_inbox', 'list_unread', 'get_chat', 'read_chat',
+    'search_messages', 'poll_messages', 'download_asset',
+  ].sort();
+  assert.deepEqual([...S.READ_TOOL_NAMES].sort(), expected);
+});
+
 // ── lite-mode bind is loopback by default (security) ──────────────
 // The MCP server used to bind 0.0.0.0 unconditionally; in lite mode (no Docker
 // loopback publish in front) that put the full tool surface on the LAN. The
