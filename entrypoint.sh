@@ -61,8 +61,18 @@ echo "[ok] socat forwarder 0.0.0.0:23380 -> 127.0.0.1:23373"
 # opinionated tool surface for ai agent runtimes (claude code, cursor,
 # bareagent, etc.). reads BEEPER_TOKEN from env to authenticate against
 # the local beeper api.
-node /opt/mcp/server.js &
-echo "[ok] beeperbox-mcp on 0.0.0.0:23375"
+#
+# Two instances against the SAME beeper api (127.0.0.1:23373), split by
+# capability so most agents get read-only reach and only a gated few can send:
+#   :23375  read-only  (8 read tools)  — gated by MCP_READ_TOKEN
+#   :23376  read-write (all 12 tools)  — gated by MCP_WRITE_TOKEN
+# Each process gets its own MCP_AUTH_TOKEN via the launch-line env prefix; the
+# write instance uses a distinct sent-ledger so the read instance (which never
+# writes) can't be confused with it.
+MCP_PORT=23375 MCP_READ_ONLY=1 MCP_AUTH_TOKEN="${MCP_READ_TOKEN:-}" node /opt/mcp/server.js &
+echo "[ok] beeperbox-mcp (read-only) on 0.0.0.0:23375"
+MCP_PORT=23376 MCP_READ_ONLY=0 MCP_AUTH_TOKEN="${MCP_WRITE_TOKEN:-}" BEEPERBOX_SENT_LEDGER=/root/.config/beeperbox/sent-ledger-write.json node /opt/mcp/server.js &
+echo "[ok] beeperbox-mcp (read-write) on 0.0.0.0:23376"
 
 for i in $(seq 1 60); do
   if curl -sf http://localhost:23373/v1/spec > /dev/null 2>&1; then

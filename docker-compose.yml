@@ -30,7 +30,9 @@ services:
       #   BEEPERBOX_NOVNC_PORT=16080 docker compose up -d
       - "127.0.0.1:${BEEPERBOX_NOVNC_PORT:-6080}:6080"
       - "127.0.0.1:${BEEPERBOX_HOST_PORT:-23373}:23380"
+      # MCP split: :23375 read-only (most agents), :23376 read-write (gated few).
       - "127.0.0.1:${BEEPERBOX_MCP_PORT:-23375}:23375"
+      - "127.0.0.1:${BEEPERBOX_MCP_WRITE_PORT:-23376}:23376"
     environment:
       # Bearer token for the Beeper Desktop API. Created in Beeper's
       # Settings -> Developers panel after first login. Required for
@@ -38,14 +40,16 @@ services:
       # raw API on :23373 is reachable (and even that needs the token
       # for everything except /v1/info).
       BEEPER_TOKEN: ${BEEPER_TOKEN:-}
-      # Optional bearer token for the MCP HTTP transport (:23375). When set,
-      # every MCP HTTP request must send `Authorization: Bearer <token>`.
-      # Leave empty to keep the transport open and rely on the loopback
-      # publish above. The stdio transport (docker exec -i … --stdio) is
-      # local-only and unaffected. Host/Origin are always validated against
-      # loopback to block DNS-rebinding; set MCP_ALLOWED_HOSTS for a reverse
-      # proxy in front (e.g. MCP_ALLOWED_HOSTS=mcp.example.com).
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      # Per-instance bearer tokens for the two MCP HTTP transports. Each is
+      # threaded to its process as MCP_AUTH_TOKEN in entrypoint.sh, so every MCP
+      # request on that port must send `Authorization: Bearer <token>`. Leave
+      # empty to keep an instance open (relying on the loopback publish above) —
+      # NOT recommended once BEEPER_TOKEN is set. The stdio transport
+      # (docker exec -i … --stdio) is local-only and unaffected. Host/Origin are
+      # always validated against loopback to block DNS-rebinding; set
+      # MCP_ALLOWED_HOSTS for a reverse proxy (e.g. MCP_ALLOWED_HOSTS=mcp.example.com).
+      MCP_READ_TOKEN: ${MCP_READ_TOKEN:-}     # gates :23375 (read-only)
+      MCP_WRITE_TOKEN: ${MCP_WRITE_TOKEN:-}   # gates :23376 (read-write)
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
       # Optional password for the noVNC/VNC session (:6080). When set, x11vnc
       # requires VNC authentication instead of serving an open session. Leave
@@ -70,6 +74,13 @@ services:
     # a single-tenant container that already trusts Beeper Desktop.)
     security_opt:
       - no-new-privileges:true
+    # Electron runs as root with --no-sandbox inside the container; drop every
+    # Linux capability so a renderer/RCE compromise can't use any (it needs
+    # none — verified running). Pairs with no-new-privileges to shrink the
+    # host-escape surface. cap_drop ALL only (read-only rootfs was rejected as
+    # too fragile for Electron).
+    cap_drop:
+      - ALL
 
 volumes:
   beeperbox_config:
