@@ -7,7 +7,7 @@ services:
       # Bump both together when deliberately upgrading Beeper; leave them and
       # the upstream default (empty args) tracks rolling stable.
       args:
-        BEEPER_VERSION: "4.2.957"
-        BEEPER_SHA256: "5850bc5af206e24130ec7614bb62db7e67e5203d9fc6d6010c19ccf9b4656a45"
+        BEEPER_VERSION: "4.3.57"
+        BEEPER_SHA256: "0ef07152355ab85be4ae3681fa5795ca94f346fce20b98498d7526a110675301"
     image: beeperbox:dev
     pull_policy: never
