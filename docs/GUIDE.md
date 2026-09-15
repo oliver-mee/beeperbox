@@ -52,7 +52,7 @@ If you are a **laptop user** with Beeper Desktop installed locally, you do not n
 
 The container is the same machinery, packaged for environments where running Beeper Desktop on the host is not an option.
 
-**One exception — lite mode.** If Beeper Desktop is already open on your machine *and* you specifically want beeperbox's opinionated 12-tool surface (the normalized schemas, the `source` echo-guard, the `poll_messages` watch primitive) instead of Beeper's raw API, run `npx beeperbox` — the same verb server, standalone, no container. See [Lite mode (run without Docker)](#lite-mode-run-without-docker).
+**One exception — lite mode.** If Beeper Desktop is already open on your machine *and* you specifically want beeperbox's opinionated 15-tool surface (the normalized schemas, the `source` echo-guard, the `poll_messages` watch primitive) instead of Beeper's raw API, run `npx beeperbox` — the same verb server, standalone, no container. See [Lite mode (run without Docker)](#lite-mode-run-without-docker).
 
 It is **not** a bot framework, **not** an agent runtime, and **not** a general-purpose messaging gateway. It is the messaging substrate other software plugs into.
 
@@ -201,7 +201,7 @@ If you see an error, jump to [Troubleshooting](#troubleshooting).
 
 ### What you can do next
 
-- **Point an AI agent runtime at it**: Claude Code, Cursor, Cline, bareagent — any MCP client that supports stdio or HTTP transport can consume beeperbox as a tool source. Configure it once and the LLM sees all 12 tools (`list_inbox`, `list_unread`, `poll_messages`, `read_chat`, `get_chat`, `search_messages`, `list_accounts`, `send_message`, `note_to_self`, `react_to_message`, `archive_chat`, `download_asset`). See the [MCP tools reference](#mcp-tools-reference) section below.
+- **Point an AI agent runtime at it**: Claude Code, Cursor, Cline, bareagent — any MCP client that supports stdio or HTTP transport can consume beeperbox as a tool source. Configure it once and the LLM sees up to 15 tools (`list_inbox`, `list_unread`, `poll_messages`, `read_chat`, `get_chat`, `search_messages`, `list_accounts`, `send_message`, `note_to_self`, `react_to_message`, `archive_chat`, `download_asset`, `send_draft`, `list_labels`, `update_label` — narrowed per instance by `MCP_TOOL_MODE`). See the [MCP tools reference](#mcp-tools-reference) section below.
 - **Build something custom**: hit the raw Beeper API on `http://localhost:23373/v1/*` from any language with an HTTP client and your `BEEPER_TOKEN`. See [Use it — real examples](#use-it--real-examples) for curl / Node / Python snippets.
 - **Deploy to a VPS**: same steps work on any Linux box with Docker. SSH-tunnel noVNC for the one-time login. See [Deploy to a VPS](#deploy-to-a-vps).
 
@@ -497,9 +497,9 @@ If you call `/v1/*` directly instead of going through the MCP tools, you inherit
 
 ## MCP tools reference
 
-beeperbox exposes 11 semantic tools over Model Context Protocol on two interchangeable transports. Any AI agent runtime that speaks MCP (Claude Code, Cursor, Cline, Continue, bareagent, etc.) can consume them.
+beeperbox exposes 15 semantic tools over Model Context Protocol on two interchangeable transports. Any AI agent runtime that speaks MCP (Claude Code, Cursor, Cline, Continue, bareagent, etc.) can consume them.
 
-### The 12 tools
+### The 15 tools
 
 | Tool | Required | Returns | Use case |
 |---|---|---|---|
@@ -515,6 +515,28 @@ beeperbox exposes 11 semantic tools over Model Context Protocol on two interchan
 | `react_to_message` | `chat_id`, `message_id`, `emoji` | `{...status: reacted}` | Lightweight ack, no full reply needed |
 | `archive_chat` | `chat_id` | `{chat_id, archived}` | Clean handled chats out of inbox (closest primitive to mark-as-read that Beeper exposes) |
 | `download_asset` | `src_url` *or* `chat_id`+`message_id` | `{src_url, content_type, bytes, encoding, data_base64, ...}` | Fetch an attachment's actual bytes (base64) — reach a media/PDF/doc file an LLM can index. Capped at `BEEPERBOX_MAX_ASSET_BYTES` (default 8 MiB) |
+| `send_draft` | `chat_id` | `{chat_id, action, draft, sent: false}` | Pre-fill the human's composer for that chat (markdown → rich text). **Never sends** — the human reviews and fires (or deletes) it themselves. `clear: true` empties the draft. The human-in-the-loop approval primitive for `notes`-mode agents |
+| `list_labels` | — | `{instance_label_scope, labels: [{label_id, title, chat_count, chats[]}]}` | See the user's Beeper labels (private cross-platform chat folders), which chats carry each, and what this instance's `MCP_LABEL_ALLOW` scope covers |
+| `update_label` | `title` | `{label_id, title, added, removed, chat_count}` | Add/remove chats from a label, create one (unknown title + `add_chat_ids`), or `rename`. Labels are Matrix account data — invisible to contacts, nothing is sent anywhere |
+
+### Tool modes & label scoping
+
+One `server.js` can boot as different capability surfaces, so an operator can hand each agent exactly the instance its job deserves. Two orthogonal dials:
+
+**`MCP_TOOL_MODE`** — which tools exist on the instance. Non-selected tools are hidden from `tools/list` **and** rejected in `tools/call`, so a client that hardcodes a name still can't reach them (covers stdio too, not just HTTP). Tools fall into four safety groups: *read* (no side effects), *self-write* (`note_to_self`, `send_draft` — mutate only your own notes or an unsent composer), *outbound-write* (`send_message`, `react_to_message`, `archive_chat` — visible to other people), *label-write* (`update_label` — private organization only).
+
+| Mode | Surface | Typical tenant |
+|---|---|---|
+| `read-only` | reads only | default triage agents, anything reachable over a tunnel |
+| `notes` | reads + self-write | an agent that may draft replies and jot notes but must **never** send to a third party |
+| `labels` | reads + label-write | an organizer agent that curates label sets, still can't send |
+| `read-write` | everything | your one trusted operator agent |
+
+`MCP_TOOL_MODE` unset ⇒ legacy behaviour: `MCP_READ_ONLY=1` → `read-only`, else `read-write`. Unknown mode ⇒ `read-only` with a loud boot warning (fail closed).
+
+**`MCP_LABEL_ALLOW`** — restrict *which chats* an instance can see and touch, by Beeper label. Labels are the user's cross-platform chat folders (WhatsApp + Slack + Telegram chats under one title), stored as private Matrix account data (`com.beeper.labels`), so one scope string spans every network. Set it to a comma-separated list of label titles (case-insensitive) or label ids and the instance becomes a scoped world: `list_inbox` / `list_unread` only return in-scope chats (each annotated with its `labels[]`), `search_messages` drops out-of-scope hits, `get_chat` / `read_chat` / `poll_messages` refuse out-of-scope `chat_id`s, and the write verbs (`send_message`, `react_to_message`, `archive_chat`, `send_draft`, `update_label`) enforce the same gate — an agent scoped to "Work" literally cannot message outside it. `note_to_self` is exempt (its recipient is auto-resolved to the self chat, not a third party). Enforcement fails **closed**: if a scope is configured but labels can't be resolved (Beeper mid-sync, no Beeper-native account), chat verbs error rather than leak the full inbox. Label reads are cached briefly (`BEEPERBOX_LABEL_CACHE_TTL_MS`, default 30 s) so labeling a chat in Desktop takes effect within a beat.
+
+Compose the two dials per instance (per port + token): e.g. `MCP_TOOL_MODE=notes` for the personal assistant, `MCP_TOOL_MODE=notes MCP_LABEL_ALLOW=Preface` for the work triager, `MCP_TOOL_MODE=read-write` loopback-only for you.
 
 #### `poll_messages` — the watch loop
 
@@ -536,6 +558,7 @@ Chat:
   is_note_to_self  true if this is the user's own self chat (filtered from list_inbox)
   last_message_at  ISO 8601 timestamp of the most recent activity
   unread_count     integer
+  labels           (when MCP_LABEL_ALLOW is set) array of label titles this chat carries
 
 Message:
   id               stable message identifier
@@ -625,7 +648,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
 
 ## Lite mode (run without Docker)
 
-Everything above runs Beeper Desktop **inside** the container. **Lite mode** is the other way to run beeperbox: only the MCP verb server, pointed at a Beeper Desktop **you already run** on your own machine — no Docker, no Electron, no Xvfb. It's the exact same `mcp/server.js` the container runs (identical 12 tools, identical version), just packaged as an npm bin.
+Everything above runs Beeper Desktop **inside** the container. **Lite mode** is the other way to run beeperbox: only the MCP verb server, pointed at a Beeper Desktop **you already run** on your own machine — no Docker, no Electron, no Xvfb. It's the exact same `mcp/server.js` the container runs (identical 15 tools, identical version), just packaged as an npm bin.
 
 Use lite mode when Beeper Desktop is already open on the machine and you want beeperbox's verb surface without the container. Use the container when there's no human/desktop in the loop (always-on, VPS, headless).
 
@@ -671,6 +694,8 @@ On boot it logs a one-line reachability verdict so a bad token or unreachable Be
 | `MCP_AUTH_TOKEN` | Optional bearer guard on the MCP endpoint | unset (open on loopback) |
 | `MCP_ALLOWED_HOSTS` | Host/Origin allowlist | `localhost,127.0.0.1,::1` |
 | `MCP_BIND_ADDR` | Interface the MCP server binds | `127.0.0.1` (loopback) |
+| `MCP_TOOL_MODE` | Capability surface: `read-only` \| `notes` \| `labels` \| `read-write` | `read-write` (legacy `MCP_READ_ONLY=1` ⇒ `read-only`) |
+| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids restricting every chat-bearing verb | unset (no restriction) |
 
 **Security:** lite mode binds **loopback only** (`127.0.0.1`) by default — safe with no auth, because only processes on your own machine can reach it. This is a *different* mechanism from the container: the container binds `0.0.0.0` and relies on Docker's `127.0.0.1` port publish as the boundary, but lite mode has no such layer, so its bind is the boundary. **Do not just set `MCP_BIND_ADDR=0.0.0.0`** to "make it reachable" — a same-network attacker can spoof the `Host` header past the allowlist and reach the full tool surface (read every message, send across every network) with no auth. To expose it deliberately, set `MCP_BIND_ADDR=0.0.0.0` **and** `MCP_AUTH_TOKEN`, and front it with a tunnel (SSH / Tailscale / TLS reverse proxy).
 

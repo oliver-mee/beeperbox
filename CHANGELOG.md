@@ -14,9 +14,16 @@ Published tags on GHCR: `:X.Y.Z` (exact, immutable), `:X.Y` (rolling within a mi
 
 ## [Unreleased]
 
+### Added
+
+- **Tool modes: `MCP_TOOL_MODE` (`read-only` | `notes` | `labels` | `read-write`).** The binary read-only flag generalizes into four capability surfaces built from four disjoint tool groups (read / self-write / outbound-write / label-write). Non-selected tools are hidden from `tools/list` AND rejected in `tools/call`, across HTTP and stdio. `notes` mode is the human-in-the-loop tier: an agent can `note_to_self` and `send_draft` but can never reach a third party. Legacy `MCP_READ_ONLY=1` still maps to `read-only`; an unknown mode fails closed to `read-only` with a boot warning.
+- **`send_draft` — composer pre-fill, never sends.** PATCHes the chat's draft via the Desktop API's `draft` input, so the text lands in the human's Beeper composer to review/fire/delete. Drafted text is recorded in the sent ledger, so a human-fired draft read-back still tags `source: "api"`.
+- **Beeper label support: `list_labels` / `update_label` + `MCP_LABEL_ALLOW` scoping.** Labels are Beeper's private cross-platform chat folders (Matrix account data `com.beeper.labels` — invisible to contacts; verified read + write against a live Desktop). The new tools list and curate them, and `MCP_LABEL_ALLOW` restricts an entire instance to the chats carrying named labels: listings filter, searches drop out-of-scope hits, and every chat-addressing verb — reads and writes alike — rejects out-of-scope `chat_id`s. Fails closed when labels are unresolvable. Chats gain a `labels[]` field when a scope is active.
+- Docs: GUIDE "Tool modes & label scoping" section, 15-tool reference rows, env tables (README / mcp/README / GUIDE), Chat schema note; guard-check boots a `notes` instance and asserts the new hidden/reject matrix; unit tests pin group disjointness, mode math, label parsing, case-insensitive scope matching, and fail-closed.
+
 ### Fixed
 
-- **Publish workflow pinned to `npm@11` — npm 12.0.0's `npm publish --provenance` is broken.** The job ran `npm install -g npm@latest`, which started resolving to npm 12.0.0 (released 2026-07-09) on the Node 22 runner. npm 12's `libnpmpublish` provenance code does `require('sigstore')`, but the tarball bundles only the `@sigstore/*` scoped packages — so `--provenance` dies with `MODULE_NOT_FOUND` and the publish fails outright. npm@11 bundles `sigstore` and publishes fine. Pinned to the major rather than floating on `@latest`. Revisit once npm ships a provenance fix. CI only — no runtime or published-artifact change.
+- **Publish workflow pinned to `npm@11` — npm 12.0.0's `npm publish --provenance` is broken.** The job ran `npm install -g npm@latest`, which started resolving to npm 12.0.0 (released 2026-07-09) on the Node 22 runner. npm 12's `libnpmpublish` provenance code does `require('sigstore')`, but the tarball bundles only the `@sigstore/*` scoped packages — so `--provenance` dies with `MODULE_NOT_FOUND` and the publish fails outright. npm@11 bundles `sigstore` and publishes fine. Revisit once npm ships a provenance fix. CI only — no runtime or published-artifact change.
 
 ### Changed
 

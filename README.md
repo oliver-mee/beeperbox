@@ -20,7 +20,7 @@ WhatsApp, iMessage, Signal, Telegram, Discord, Slack, Messenger, Instagram, Link
 
 ## Two ways to run
 
-Same MCP server, same 12 tools, same `serverInfo.version` — by construction, because both modes run the [same single file](mcp/server.js). Pick by where Beeper lives:
+Same MCP server, same 15 tools, same `serverInfo.version` — by construction, because both modes run the [same single file](mcp/server.js). Pick by where Beeper lives:
 
 | | **Container** | **Lite** (`npx`) |
 |---|---|---|
@@ -78,7 +78,7 @@ Done.
 |---|---|---|
 | `6080` | noVNC web UI — first-run login only | `127.0.0.1` |
 | `23373` | Raw Beeper Desktop HTTP API | `127.0.0.1` |
-| `23375` | Opinionated 12-tool MCP server | `127.0.0.1` |
+| `23375` | Opinionated 15-tool MCP server | `127.0.0.1` |
 
 All three are env-overridable (`BEEPERBOX_NOVNC_PORT`, `BEEPERBOX_HOST_PORT`, `BEEPERBOX_MCP_PORT`) so you can run multiple instances on one VPS. For remote access use SSH tunnel, Tailscale, or a TLS reverse proxy — never drop the `127.0.0.1` prefix.
 
@@ -116,6 +116,8 @@ BEEPER_TOKEN=your-token-here npx beeperbox --stdio
 | `MCP_AUTH_TOKEN` | Optional bearer guard on the MCP endpoint | unset (open on loopback) |
 | `MCP_ALLOWED_HOSTS` | Host/Origin allowlist | `localhost,127.0.0.1,::1` |
 | `MCP_BIND_ADDR` | Interface the MCP server binds | `127.0.0.1` (loopback) |
+| `MCP_TOOL_MODE` | Capability surface: `read-only` \| `notes` \| `labels` \| `read-write` | `read-write` (legacy `MCP_READ_ONLY=1` ⇒ `read-only`) |
+| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids restricting every chat-bearing verb | unset (no restriction) |
 
 **Security:** lite mode binds **loopback only** (`127.0.0.1`) by default, so it's safe with no auth — only processes on your machine (your agent, Claude Code) can reach it. Do **not** just flip it to `0.0.0.0`: a same-network attacker can spoof the `Host` header past the allowlist and reach the full tool surface (read every message, send across every network) unauthenticated. To expose it deliberately, set `MCP_BIND_ADDR=0.0.0.0` **and** `MCP_AUTH_TOKEN`, and front it with a tunnel (SSH / Tailscale / TLS reverse proxy) — never raw on a public interface. (The container binds `0.0.0.0` on purpose because Docker publishes it on `127.0.0.1` — that loopback *publish* is its boundary; lite mode has no such layer, which is why its *bind* is loopback.)
 

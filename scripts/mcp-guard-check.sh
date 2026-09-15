@@ -11,6 +11,10 @@
 set -u
 
 IMAGE="${1:?usage: mcp-guard-check.sh <image_ref>}"
+# Host port base: upstream CI runs on a clean runner and uses 2337x. On a box
+# already running a live beeperbox (which publishes 23375/23376), override to a
+# free base, e.g. GUARD_PORT_BASE=28373 scripts/mcp-guard-check.sh <image>.
+GPB="${GUARD_PORT_BASE:-23373}"
 OPEN=mcp-guard-open
 AUTH=mcp-guard-auth
 RO=mcp-guard-ro
@@ -34,15 +38,15 @@ wait_ready() { # url [extra curl args...]
 }
 
 # ── open mode ─────────────────────────────────────────────────────
-docker run -d --name "$OPEN" -p 23375:23375 --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
-wait_ready http://127.0.0.1:23375 || { echo "FAIL: open server never became ready"; docker logs "$OPEN"; exit 1; }
-U=http://127.0.0.1:23375
+docker run -d --name "$OPEN" -p $((GPB+2)):23375 --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
+wait_ready http://127.0.0.1:$((GPB+2)) || { echo "FAIL: open server never became ready"; docker logs "$OPEN"; exit 1; }
+U=http://127.0.0.1:$((GPB+2))
 
 names=$(curl -s -X POST "$U" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name')
 for t in list_accounts list_inbox list_unread get_chat read_chat \
          search_messages send_message note_to_self react_to_message archive_chat \
-         poll_messages download_asset; do
+         poll_messages download_asset send_draft list_labels update_label; do
   if echo "$names" | grep -qx "$t"; then echo "PASS: tool $t present"; else echo "FAIL: tool $t missing"; fail=1; fi
 done
 
@@ -59,11 +63,11 @@ chk "12MB body -> 413 (body cap)" 413 \
   "$(code -X POST "$U" -H 'Content-Type: application/json' --data-binary @/tmp/mcp-big.json)"
 
 # ── auth mode ─────────────────────────────────────────────────────
-docker run -d --name "$AUTH" -p 23376:23375 -e MCP_AUTH_TOKEN=ci-secret \
+docker run -d --name "$AUTH" -p $((GPB+3)):23375 -e MCP_AUTH_TOKEN=ci-secret \
   --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
-wait_ready http://127.0.0.1:23376 -H 'Authorization: Bearer ci-secret' \
+wait_ready http://127.0.0.1:$((GPB+3)) -H 'Authorization: Bearer ci-secret' \
   || { echo "FAIL: auth server never became ready"; docker logs "$AUTH"; exit 1; }
-A=http://127.0.0.1:23376
+A=http://127.0.0.1:$((GPB+3))
 chk "no auth header -> 401" 401 \
   "$(code -X POST "$A" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
 chk "wrong token -> 401" 401 \
@@ -71,27 +75,51 @@ chk "wrong token -> 401" 401 \
 chk "correct token -> 200" 200 \
   "$(code -X POST "$A" -H 'Authorization: Bearer ci-secret' -d '{"jsonrpc":"2.0","id":3,"method":"tools/list"}')"
 
-# ── read-only mode (MCP_READ_ONLY=1) ──────────────────────────────
-# The 4 mutating verbs must be hidden from tools/list AND rejected in
-# tools/call even if a client hardcodes the name; the 8 reads stay available.
-docker run -d --name "$RO" -p 23377:23375 -e MCP_READ_ONLY=1 \
+# ── read-only mode (MCP_READ_ONLY=1 legacy + MCP_TOOL_MODE) ──────
+# The mutating verbs must be hidden from tools/list AND rejected in
+# tools/call even if a client hardcodes the name; the reads stay available.
+docker run -d --name "$RO" -p $((GPB+4)):23375 -e MCP_READ_ONLY=1 \
   --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
-wait_ready http://127.0.0.1:23377 \
+wait_ready http://127.0.0.1:$((GPB+4)) \
   || { echo "FAIL: read-only server never became ready"; docker logs "$RO"; exit 1; }
-R=http://127.0.0.1:23377
+R=http://127.0.0.1:$((GPB+4))
 
 ro_names=$(curl -s -X POST "$R" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name')
-for t in send_message note_to_self react_to_message archive_chat; do
+for t in send_message note_to_self react_to_message archive_chat send_draft update_label; do
   if echo "$ro_names" | grep -qx "$t"; then echo "FAIL: write tool $t exposed in read-only mode"; fail=1; else echo "PASS: write tool $t hidden"; fi
 done
 for t in list_accounts list_inbox list_unread get_chat read_chat \
-         search_messages poll_messages download_asset; do
+         search_messages poll_messages download_asset list_labels; do
   if echo "$ro_names" | grep -qx "$t"; then echo "PASS: read tool $t present in read-only mode"; else echo "FAIL: read tool $t missing in read-only mode"; fail=1; fi
 done
 ro_err=$(curl -s -X POST "$R" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{}}}' | jq -r '.error.code // empty')
 chk "read-only send_message tools/call -> rejected (-32601)" "-32601" "${ro_err:-none}"
+
+# ── notes mode (MCP_TOOL_MODE=notes) ──────────────────────────────
+# Reads + self-write (note_to_self, send_draft) only: the agent can jot to
+# itself and pre-fill a human's composer, but can never reach a third party.
+NOTES=mcp-guard-notes
+docker rm -f "$NOTES" >/dev/null 2>&1 || true
+docker run -d --name "$NOTES" -p $((GPB+5)):23375 -e MCP_TOOL_MODE=notes \
+  --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
+cleanup() { docker rm -f "$OPEN" "$AUTH" "$RO" "$NOTES" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+wait_ready http://127.0.0.1:$((GPB+5)) \
+  || { echo "FAIL: notes server never became ready"; docker logs "$NOTES"; exit 1; }
+N=http://127.0.0.1:$((GPB+5))
+n_names=$(curl -s -X POST "$N" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name')
+for t in note_to_self send_draft; do
+  if echo "$n_names" | grep -qx "$t"; then echo "PASS: notes tool $t present"; else echo "FAIL: notes tool $t missing"; fail=1; fi
+done
+for t in send_message react_to_message archive_chat update_label; do
+  if echo "$n_names" | grep -qx "$t"; then echo "FAIL: outward tool $t exposed in notes mode"; fail=1; else echo "PASS: outward tool $t hidden in notes mode"; fi
+done
+n_err=$(curl -s -X POST "$N" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{}}}' | jq -r '.error.code // empty')
+chk "notes send_message tools/call -> rejected (-32601)" "-32601" "${n_err:-none}"
 
 if [ "$fail" -eq 0 ]; then echo "=== MCP GUARD CHECK PASSED ==="; else echo "=== MCP GUARD CHECK FAILED ==="; fi
 exit "$fail"

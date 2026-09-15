@@ -58,18 +58,155 @@ const MCP_ALLOWED_HOSTS = new Set(
 );
 const MCP_MAX_BODY = parseInt(process.env.MCP_MAX_BODY || String(1024 * 1024), 10);
 
-// ─── read-only mode ───────────────────────────────────────────────
-// MCP_READ_ONLY=1 hides the 4 mutating tools from tools/list AND rejects them
-// in callTool, so a client that hardcodes a name still can't mutate. This is a
-// per-tool CAPABILITY gate, orthogonal to the per-request AUTH gate above — it
-// runs in the transport-agnostic request path (below), so it covers stdio too,
-// not just HTTP. Lets most agents run against a read-only instance while a
-// separate write-capable instance (own port + token) is reserved for the few
-// that must send. WRITE_TOOLS = exactly the handlers that issue a POST.
-const READ_ONLY = /^(1|true)$/i.test(process.env.MCP_READ_ONLY || '');
-const WRITE_TOOLS = new Set([
-  'send_message', 'note_to_self', 'react_to_message', 'archive_chat',
+// ─── tool modes (capability gating) ───────────────────────────────
+// MCP_TOOL_MODE selects which tools an instance exposes. Non-selected tools
+// are hidden from tools/list AND rejected in callTool, so a client that
+// hardcodes a name still can't reach them. This is a per-tool CAPABILITY gate,
+// orthogonal to the per-request AUTH gate above — it runs in the
+// transport-agnostic request path (below), so it covers stdio too, not just
+// HTTP. Operators run several instances of THIS file on different ports/tokens,
+// each in a different mode, and hand each agent the instance matching its job.
+//
+// Tool groups (mutually exclusive by safety class):
+//   read          — no side effects; nothing leaves the box except GETs.
+//   selfWrite     — mutate local/self state only: a note to yourself, or a
+//                   DRAFT in someone's chat that stays unsent until the human
+//                   presses send. Nothing reaches a third party.
+//   outboundWrite — messages/reactions visible to other people, archive.
+//   labelWrite    — mutates the user's own label (cross-platform chat folder)
+//                   definitions via Matrix account data; invisible to contacts.
+//
+// Modes:
+//   read-only  = read
+//   notes      = read + selfWrite       ("watch everything, jot to self, draft
+//                                          for human approval — never send")
+//   labels     = read + labelWrite      (curate label sets, still can't send)
+//   read-write = everything
+//
+// Back-compat: MCP_TOOL_MODE unset ⇒ legacy MCP_READ_ONLY=1 → read-only,
+// else read-write (exactly the old behaviour). Unknown mode ⇒ read-only +
+// loud warning (fail closed, but stay up for the operator to fix).
+const GROUP_READ = new Set([
+  'list_accounts', 'list_inbox', 'list_unread', 'get_chat', 'read_chat',
+  'search_messages', 'poll_messages', 'download_asset', 'list_labels',
 ]);
+const GROUP_SELF = new Set(['note_to_self', 'send_draft']);
+const GROUP_OUTBOUND = new Set(['send_message', 'react_to_message', 'archive_chat']);
+const GROUP_LABEL = new Set(['update_label']);
+
+function allowedSetForMode(mode) {
+  switch (mode) {
+    case 'read-only': return new Set(GROUP_READ);
+    case 'notes': return new Set([...GROUP_READ, ...GROUP_SELF]);
+    case 'labels': return new Set([...GROUP_READ, ...GROUP_LABEL]);
+    case 'read-write':
+      return new Set([...GROUP_READ, ...GROUP_SELF, ...GROUP_OUTBOUND, ...GROUP_LABEL]);
+    default: return null;
+  }
+}
+
+const LEGACY_READ_ONLY = /^(1|true)$/i.test(process.env.MCP_READ_ONLY || '');
+const MODE = String(process.env.MCP_TOOL_MODE || (LEGACY_READ_ONLY ? 'read-only' : 'read-write')).trim().toLowerCase();
+let ALLOWED_TOOLS = allowedSetForMode(MODE);
+if (!ALLOWED_TOOLS) {
+  process.stderr.write(`[beeperbox-mcp] unknown MCP_TOOL_MODE "${MODE}" — falling back to read-only (fail-closed). Valid: read-only | notes | labels | read-write\n`);
+  ALLOWED_TOOLS = allowedSetForMode('read-only');
+}
+
+// ─── label scoping (per-instance chat filter) ─────────────────────
+// MCP_LABEL_ALLOW="Work,Client X" (comma-separated Beeper label TITLES or
+// label ids) restricts this instance to chats carrying at least one of those
+// labels. Applies to every chat-bearing verb: inbox/unread listings are
+// filtered, get/read/search/poll only see in-scope chats, and the write verbs
+// (send/react/archive/draft) refuse out-of-scope chat_ids. Labels are the
+// user's cross-platform grouping (Matrix account data com.beeper.labels), so
+// one scope covers WhatsApp + Slack + Telegram chats at once. Unset ⇒ no
+// restriction. Fails closed: if a scope is configured but labels cannot be
+// resolved (Beeper syncing, no matrix account), chat verbs error rather than
+// leak the full inbox. note_to_self is exempt (recipient is auto-resolved to
+// the self chat — it is not a third-party chat).
+const LABEL_ALLOW_DEFAULT = (process.env.MCP_LABEL_ALLOW || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+let LABEL_ALLOW = LABEL_ALLOW_DEFAULT;
+const LABEL_EVENT_TYPE = 'com.beeper.labels';
+// TTL on the parsed label event; short because labels change while the user
+// works in Desktop and the scope must follow within a beat. 0 = always live.
+const LABEL_CACHE_TTL_MS = envIntNonNeg('BEEPERBOX_LABEL_CACHE_TTL_MS', 30000);
+let labelCache = null; // { defs:[{label_id,title,rooms}], byRoom, userId, at }
+
+function isAccountDataMissing(err) {
+  return /No account data event found/i.test(err?.message || '');
+}
+
+// Read + parse the label account-data event. opts: {fresh: bypass cache,
+// strict: throw on transport/API errors instead of degrading to empty}.
+async function getLabelData(opts = {}) {
+  const now = nowFn();
+  if (!opts.fresh && labelCache && LABEL_CACHE_TTL_MS > 0
+      && (now - labelCache.at) < LABEL_CACHE_TTL_MS) {
+    return labelCache;
+  }
+  const accounts = accountList(await beeperFetch('/v1/accounts'));
+  const matrix = accounts.find((a) => a.accountID === 'matrix' || a.bridge?.id === 'matrix');
+  const userId = matrix?.user?.id;
+  if (!userId) {
+    if (opts.strict) throw rpcError(-32002, 'no Beeper-native (matrix) account found — labels unavailable; label scope stays closed');
+    return null;
+  }
+  let defsRaw = {};
+  try {
+    defsRaw = await beeperFetch(`/_matrix/client/v3/user/${encodeURIComponent(userId)}/account_data/${LABEL_EVENT_TYPE}`);
+  } catch (err) {
+    if (!isAccountDataMissing(err)) {
+      if (opts.strict) throw rpcError(-32002, `labels unavailable: ${err.message}`);
+      // Display/enrichment path only — enforcement passes strict and fails closed.
+      process.stderr.write(`[beeperbox-mcp] label fetch failed (non-strict): ${err.message}\n`);
+      return labelCache; // stale cache better than nothing for labels[] display
+    }
+  }
+  const defs = [];
+  const byRoom = {};
+  for (const [id, v] of Object.entries(defsRaw && typeof defsRaw === 'object' ? defsRaw : {})) {
+    if (!v || typeof v !== 'object' || !Array.isArray(v.rooms)) continue;
+    const title = String(v.title ?? '(untitled)');
+    defs.push({ label_id: id, title, rooms: v.rooms });
+    for (const r of v.rooms) (byRoom[r] = byRoom[r] || []).push(title);
+  }
+  labelCache = { defs, byRoom, userId, at: now };
+  return labelCache;
+}
+
+// The Set of room/chat ids this instance may touch, or null when unrestricted.
+async function scopedRoomSet() {
+  if (!LABEL_ALLOW.length) return null;
+  const data = await getLabelData({ strict: true });
+  const wanted = LABEL_ALLOW.map((s) => s.toLowerCase());
+  const rooms = new Set();
+  for (const l of data.defs) {
+    if (wanted.includes(l.title.toLowerCase()) || wanted.includes(l.label_id.toLowerCase())) {
+      for (const r of l.rooms) rooms.add(r);
+    }
+  }
+  return rooms;
+}
+
+async function assertChatAllowed(chatID) {
+  const scope = await scopedRoomSet();
+  if (scope && !scope.has(chatID)) {
+    throw rpcError(-32004, `chat ${chatID} is outside this instance's label scope (${LABEL_ALLOW.join(', ')})`);
+  }
+  return scope;
+}
+
+// Filter a list of normalized chats to scope AND annotate them with labels[].
+async function applyLabelScope(chats) {
+  const scope = await scopedRoomSet();
+  if (!scope) return chats;
+  const data = await getLabelData({ strict: true });
+  return chats
+    .filter((c) => scope.has(c.id))
+    .map((c) => ({ ...c, labels: data.byRoom[c.id] || [] }));
+}
 
 // Echo-guard id resolution. A send returns a `pendingMessageID`, but Beeper
 // swaps it for the real bridge id once the message is acked — so the id we'd
@@ -892,14 +1029,53 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'send_draft',
+    description: 'Place a DRAFT message in a chat\'s composer — it is NOT sent. The text appears pre-filled in the human\'s Beeper Desktop (and mobile) input box for that chat; they review, edit if they like, and press send themselves — or delete it. This is the human-in-the-loop approval primitive for agents that may compose but must never send: draft the reply to a customer, then note_to_self the chat_id so the human knows what awaits. Passing clear=true removes the current draft instead. Limitation (Beeper-side): a new draft is only accepted while the chat\'s draft box is empty — if the human is mid-typing there, clear=true first or the call reports the conflict. Returns { chat_id, action, draft, sent: false }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'The chat whose composer to pre-fill (the `id` from any Chat object).' },
+        text: { type: 'string', description: 'The drafted message text (markdown is converted to Beeper rich text the same way send_message does). Required unless clear=true.' },
+        clear: { type: 'boolean', description: 'true to clear the chat\'s existing draft instead of setting a new one.', default: false },
+        client_tag: { type: 'string', description: 'Optional caller-defined tag recorded with the draft in the sent ledger, so if the human fires it the read-back can be attributed to this draft call.' },
+      },
+      required: ['chat_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'list_labels',
+    description: 'List the user\'s Beeper LABELS — their cross-platform chat folders/tags (a label groups chats from WhatsApp, Slack, Telegram, etc. under one name, e.g. "Work"). Returns each label\'s id, title, and the chat_ids it contains, plus this instance\'s own label scope (MCP_LABEL_ALLOW) if restricted and whether each chat falls inside it. Use this to discover which chats a scoped agent may touch, or before update_label. Read-only, no side effects.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'update_label',
+    description: 'Create or update one of the user\'s Beeper labels: add chats to a label, remove chats from it, and/or rename it. Labels are private organizational data on the user\'s own account (Matrix account data) — no contact ever sees them, and nothing is sent anywhere. Find the label by `title` (case-insensitive; an unknown title with add_chat_ids CREATES it) or by `label_id`. Chat ids must be ones this instance can see (label scope, when active, applies). Note: last-write-wins against concurrent manual edits in Beeper Desktop; the server re-reads the live state immediately before writing to minimize clobbering.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Label title to find (or create, when combined with add_chat_ids).' },
+        label_id: { type: 'string', description: 'Optional exact label id (from list_labels) to target instead of title matching.' },
+        add_chat_ids: { type: 'array', items: { type: 'string' }, description: 'Chat IDs to ADD to the label.' },
+        remove_chat_ids: { type: 'array', items: { type: 'string' }, description: 'Chat IDs to REMOVE from the label.' },
+        rename: { type: 'string', description: 'Optional new title for the label.' },
+        show_in_inbox: { type: 'boolean', description: 'For created labels: whether the label shows as an inbox filter (default true).', default: true },
+      },
+      required: ['title'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function callTool(name, args) {
-  // Capability gate: in read-only mode the mutating tools are rejected even if a
+  const known = TOOLS.some((t) => t.name === name);
+  if (!known) throw rpcError(-32601, `unknown tool: ${name}`);
+  // Capability gate: tools outside this instance's mode are rejected even if a
   // client hardcodes the name (they're also hidden from tools/list). Thrown
   // before the switch so it applies uniformly across HTTP and stdio transports.
-  if (READ_ONLY && WRITE_TOOLS.has(name)) {
-    throw rpcError(-32601, `read-only mode: ${name} is disabled`);
+  if (!ALLOWED_TOOLS.has(name)) {
+    throw rpcError(-32601, `mode '${MODE}': ${name} is not enabled on this instance`);
   }
   switch (name) {
     case 'list_accounts': {
@@ -916,15 +1092,22 @@ async function callTool(name, args) {
 
     case 'get_chat': {
       if (!args.chat_id) throw rpcError(-32602, 'get_chat requires chat_id');
+      const scope = await assertChatAllowed(args.chat_id);
       const [accounts, raw] = await Promise.all([
         getAccountMap(),
         beeperFetch(`/v1/chats/${encodeURIComponent(args.chat_id)}`),
       ]);
-      return normalizeChat(raw, accounts);
+      const chat = normalizeChat(raw, accounts);
+      if (scope) {
+        const data = await getLabelData();
+        chat.labels = data?.byRoom[chat.id] || [];
+      }
+      return chat;
     }
 
     case 'read_chat': {
       if (!args.chat_id) throw rpcError(-32602, 'read_chat requires chat_id');
+      await assertChatAllowed(args.chat_id);
       const limit = Math.min(Math.max(args.limit || 20, 1), 100);
       // Same Beeper-side minimum-page-size workaround as list_inbox: the API
       // returns ~25 items regardless of ?limit=, so over-fetch then slice.
@@ -943,6 +1126,7 @@ async function callTool(name, args) {
 
     case 'archive_chat': {
       if (!args.chat_id) throw rpcError(-32602, 'archive_chat requires chat_id');
+      await assertChatAllowed(args.chat_id);
       const archived = args.archived !== false; // default true
       await beeperFetch(`/v1/chats/${encodeURIComponent(args.chat_id)}/archive`, {
         method: 'POST',
@@ -960,10 +1144,10 @@ async function callTool(name, args) {
         beeperFetch(`/v1/chats?limit=${Math.max(limit, 25)}`),
       ]);
       const list = raw.items || raw.chats || (Array.isArray(raw) ? raw : []);
-      return list
-        .map((c) => normalizeChat(c, accounts))
-        .filter((c) => !c.is_note_to_self)
-        .slice(0, limit);
+      const scoped = await applyLabelScope(
+        list.map((c) => normalizeChat(c, accounts)).filter((c) => !c.is_note_to_self),
+      );
+      return scoped.slice(0, limit);
     }
 
     case 'search_messages': {
@@ -980,11 +1164,18 @@ async function callTool(name, args) {
       for (const [id, c] of Object.entries(chatsMap)) {
         normalizedChats[id] = normalizeChat(c, accounts);
       }
-      const msgs = items.slice(0, limit).map((m) => {
+      let msgs = items.slice(0, limit).map((m) => {
         const chat = normalizedChats[m.chatID] || { network: 'unknown', network_label: 'Unknown' };
         return normalizeMessage(m, chat);
       });
-      return applyEchoTags(msgs, Date.now());
+      msgs = applyEchoTags(msgs, Date.now());
+      // Label scope: drop hits from out-of-scope chats (Beeper's search has no
+      // server-side room filter, so this post-filters). Over-fetching is not
+      // possible — limit is capped upstream — so a scoped instance may see
+      // fewer than `limit` hits; the agent can page with a narrower query.
+      const scope = await scopedRoomSet();
+      if (scope) msgs = msgs.filter((m) => scope.has(m.chat_id));
+      return msgs;
     }
 
     case 'note_to_self': {
@@ -1015,6 +1206,7 @@ async function callTool(name, args) {
     case 'send_message': {
       if (!args.chat_id) throw rpcError(-32602, 'send_message requires chat_id');
       if (!args.text) throw rpcError(-32602, 'send_message requires text');
+      await assertChatAllowed(args.chat_id);
       const body = { text: args.text };
       if (args.reply_to_message_id) body.replyToMessageID = args.reply_to_message_id;
       const sent = await beeperFetch(
@@ -1044,6 +1236,7 @@ async function callTool(name, args) {
       if (!args.chat_id) throw rpcError(-32602, 'react_to_message requires chat_id');
       if (!args.message_id) throw rpcError(-32602, 'react_to_message requires message_id');
       if (!args.emoji) throw rpcError(-32602, 'react_to_message requires emoji');
+      await assertChatAllowed(args.chat_id);
       await beeperFetch(
         `/v1/chats/${encodeURIComponent(args.chat_id)}/messages/${encodeURIComponent(args.message_id)}/reactions`,
         { method: 'POST', body: { reactionKey: args.emoji } },
@@ -1060,10 +1253,10 @@ async function callTool(name, args) {
         beeperFetch(`/v1/chats?limit=100`),
       ]);
       const list = raw.items || raw.chats || (Array.isArray(raw) ? raw : []);
-      return list
-        .map((c) => normalizeChat(c, accounts))
-        .filter((c) => !c.is_note_to_self && c.unread_count > 0)
-        .slice(0, limit);
+      const scoped = await applyLabelScope(
+        list.map((c) => normalizeChat(c, accounts)).filter((c) => !c.is_note_to_self && c.unread_count > 0),
+      );
+      return scoped.slice(0, limit);
     }
 
     case 'poll_messages': {
@@ -1074,12 +1267,13 @@ async function callTool(name, args) {
       // Resolve which chats to scan: one if chat_id given, else the inbox.
       let chats;
       if (args.chat_id) {
+        await assertChatAllowed(args.chat_id);
         const raw = await beeperFetch(`/v1/chats/${encodeURIComponent(args.chat_id)}`);
         chats = [normalizeChat(raw, accounts)];
       } else {
         const raw = await beeperFetch('/v1/chats?limit=100');
         const list = raw.items || raw.chats || (Array.isArray(raw) ? raw : []);
-        chats = list.map((c) => normalizeChat(c, accounts));
+        chats = await applyLabelScope(list.map((c) => normalizeChat(c, accounts)));
       }
 
       // Seed (no cursor): return the current high-water mark and NO backlog,
@@ -1132,6 +1326,7 @@ async function callTool(name, args) {
         if (!args.chat_id || !args.message_id) {
           throw rpcError(-32602, 'download_asset requires src_url, or both chat_id and message_id');
         }
+        await assertChatAllowed(args.chat_id);
         const raw = await beeperFetch(
           `/v1/chats/${encodeURIComponent(args.chat_id)}/messages/${encodeURIComponent(args.message_id)}`,
         );
@@ -1164,6 +1359,110 @@ async function callTool(name, args) {
         data_base64: bytes.toString('base64'),
       };
     }
+    case 'send_draft': {
+      // Put the text in the chat's INPUT DRAFT via PATCH /v1/chats/{id}
+      // {draft:{text}}. Nothing is sent: the human sees the pre-filled composer
+      // in Beeper Desktop and presses send (or deletes it). This is the
+      // human-in-the-loop approval primitive: agents compose, humans fire.
+      // Note: Beeper only accepts a non-empty draft when the current draft is
+      // empty, so a stale draft in that chat must be cleared first (clear=true).
+      if (!args.chat_id) throw rpcError(-32602, 'send_draft requires chat_id');
+      await assertChatAllowed(args.chat_id);
+      const body = { draft: args.clear ? null : { text: String(args.text ?? '') } };
+      if (!args.clear && !body.draft.text) throw rpcError(-32602, 'send_draft requires text (or clear=true)');
+      const raw = await beeperFetch(`/v1/chats/${encodeURIComponent(args.chat_id)}`, {
+        method: 'PATCH', body,
+      });
+      const draftCleared = args.clear === true;
+      if (!draftCleared) {
+        // Ledger the drafted text: if the human fires the draft, the sent
+        // message matches by text_hash and tags as source:'api' on read-back —
+        // agent-originated content end to end, no echo loop on approval.
+        recordSent({ chat_id: args.chat_id, sent_id: '', text: body.draft.text, client_tag: args.client_tag });
+      }
+      return {
+        chat_id: args.chat_id,
+        action: draftCleared ? 'cleared' : 'drafted',
+        draft: raw?.draft?.text ?? null,
+        sent: false,
+        client_tag: args.client_tag || null,
+      };
+    }
+
+    case 'list_labels': {
+      const data = await getLabelData({ strict: true, fresh: true });
+      const scope = await scopedRoomSet(); // null ⇒ unrestricted
+      return {
+        instance_label_scope: LABEL_ALLOW.length ? LABEL_ALLOW : null,
+        labels: data.defs.map((l) => ({
+          label_id: l.label_id,
+          title: l.title,
+          chat_count: l.rooms.length,
+          chats: l.rooms.map((r) => ({
+            chat_id: r,
+            in_instance_scope: !scope || scope.has(r),
+          })),
+        })),
+      };
+    }
+
+    case 'update_label': {
+      // Mutate the user's OWN label definitions (Matrix account data — not
+      // visible to any contact). add_chat_ids / remove_chat_ids are applied to
+      // one label, found by label_id or by title (case-insensitive). An unknown
+      // title with adds creates a fresh label (uuid id). When a label scope is
+      // active, chats outside it cannot be labelled (keeps a scoped agent's
+      // world consistent — it can only organize what it can see).
+      // This is a last-write-wins whole-event PUT; refresh the cache after.
+      if (!args.title) throw rpcError(-32602, 'update_label requires title');
+      const data = await getLabelData({ strict: true, fresh: true });
+      const adds = args.add_chat_ids || [];
+      const rems = args.remove_chat_ids || [];
+      if (!adds.length && !rems.length && !args.rename) {
+        throw rpcError(-32602, 'update_label requires add_chat_ids, remove_chat_ids, or rename');
+      }
+      const scope = await scopedRoomSet();
+      for (const id of [...adds, ...rems]) {
+        if (scope && !scope.has(id)) {
+          throw rpcError(-32004, `chat ${id} is outside this instance's label scope`);
+        }
+      }
+      let labelId = args.label_id
+        ? data.defs.find((l) => l.label_id === args.label_id)?.label_id
+        : data.defs.find((l) => l.title.toLowerCase() === String(args.title).toLowerCase())?.label_id;
+      if (args.label_id && !labelId) throw rpcError(-32004, `no label with id ${args.label_id}`);
+      if (rems.length && !labelId) throw rpcError(-32004, `label "${args.title}" not found — nothing to remove`);
+      if (args.rename && !labelId) throw rpcError(-32004, `label "${args.title}" not found — rename needs an existing label`);
+      // Rebuild from the FRESH live event (never the parsed cache) so concurrent
+      // edits by the user in Desktop aren't clobbered more than strictly needed.
+      let event = {};
+      try {
+        event = await beeperFetch(`/_matrix/client/v3/user/${encodeURIComponent(data.userId)}/account_data/${LABEL_EVENT_TYPE}`);
+      } catch (err) {
+        if (!isAccountDataMissing(err)) throw err; // missing = first label ever
+      }
+      if (!labelId && adds.length) {
+        labelId = crypto.randomUUID();
+        event[labelId] = { title: String(args.title), rooms: [], createdAt: Date.now(), isShownInInbox: args.show_in_inbox !== false };
+      }
+      const rooms = new Set(event[labelId]?.rooms || []);
+      for (const id of adds) rooms.add(id);
+      for (const id of rems) rooms.delete(id);
+      event[labelId] = { ...event[labelId], rooms: [...rooms] };
+      if (args.rename) event[labelId].title = String(args.rename);
+      await beeperFetch(`/_matrix/client/v3/user/${encodeURIComponent(data.userId)}/account_data/${LABEL_EVENT_TYPE}`, {
+        method: 'PUT', body: event,
+      });
+      labelCache = null; // force re-read on next call
+      return {
+        label_id: labelId,
+        title: event[labelId].title,
+        added: adds.length,
+        removed: rems.length,
+        chat_count: rooms.size,
+      };
+    }
+
     default:
       throw rpcError(-32601, `unknown tool: ${name}`);
   }
@@ -1202,7 +1501,7 @@ async function handleRequest(req) {
         return null;
 
       case 'tools/list':
-        result = { tools: READ_ONLY ? TOOLS.filter((t) => !WRITE_TOOLS.has(t.name)) : TOOLS };
+        result = { tools: TOOLS.filter((t) => ALLOWED_TOOLS.has(t.name)) };
         break;
 
       case 'tools/call': {
@@ -1308,7 +1607,8 @@ function startHttpTransport() {
     console.log(`[beeperbox-mcp] beeper api: ${BEEPER_API}`);
     console.log(`[beeperbox-mcp] beeper token: ${BEEPER_TOKEN ? 'set' : 'NOT SET (set BEEPER_TOKEN env var)'}`);
     console.log(`[beeperbox-mcp] http auth: ${MCP_AUTH_TOKEN ? 'required (MCP_AUTH_TOKEN set)' : 'OPEN — set MCP_AUTH_TOKEN to require a bearer token'}`);
-    console.log(`[beeperbox-mcp] mode: ${READ_ONLY ? 'READ-ONLY (' + WRITE_TOOLS.size + ' write tools disabled)' : 'read-write (all tools enabled)'}`);
+    console.log(`[beeperbox-mcp] mode: ${MODE} (${ALLOWED_TOOLS.size}/${TOOLS.length} tools enabled)`);
+    if (LABEL_ALLOW.length) console.log(`[beeperbox-mcp] label scope: ${LABEL_ALLOW.join(', ')} (fail-closed; note_to_self exempt)`);
     console.log(`[beeperbox-mcp] allowed hosts: ${[...MCP_ALLOWED_HOSTS].join(', ')}`);
     preflight();
   });
@@ -1375,11 +1675,26 @@ module.exports = {
   // version + tool names here is what guarantees the two builds can't drift.
   VERSION,
   TOOL_NAMES: TOOLS.map((t) => t.name),
-  // Read-only surface: the write set (hidden + rejected when MCP_READ_ONLY=1)
-  // and the tool names that remain. Exported so the parity test pins them
-  // without a module reload (READ_ONLY itself is fixed at load from env).
-  WRITE_TOOL_NAMES: [...WRITE_TOOLS],
-  READ_TOOL_NAMES: TOOLS.map((t) => t.name).filter((n) => !WRITE_TOOLS.has(n)),
+  // Capability surface (mode-gated): the tool groups and the resolution for
+  // THIS process's env. Exported so tests pin the group membership and the
+  // mode math without a module reload (MODE/ALLOWED_TOOLS are fixed at load).
+  TOOL_GROUPS: {
+    read: [...GROUP_READ],
+    selfWrite: [...GROUP_SELF],
+    outboundWrite: [...GROUP_OUTBOUND],
+    labelWrite: [...GROUP_LABEL],
+  },
+  MODE,
+  ALLOWED_TOOL_NAMES: TOOLS.filter((t) => ALLOWED_TOOLS.has(t.name)).map((t) => t.name),
+  allowedSetForMode,
+  WRITE_TOOL_NAMES: [...GROUP_SELF, ...GROUP_OUTBOUND],
+  READ_TOOL_NAMES: TOOLS.map((t) => t.name).filter((n) => !GROUP_SELF.has(n) && !GROUP_OUTBOUND.has(n)),
+  LABEL_ALLOW,
+  // test hooks for the label plumbing
+  _resetLabelCache: () => { labelCache = null; },
+  _setLabelScope: (list) => { LABEL_ALLOW = Array.isArray(list) ? list.map(String) : []; },
+  getLabelData,
+  scopedRoomSet,
   BIND_ADDR,
   ledgerPath,
   encodeCursor,

@@ -412,34 +412,121 @@ test('serverInfo version is single-sourced from package.json (no drift)', () => 
   assert.equal(S.VERSION, pkg.version);
 });
 
-test('the tool registry is exactly the 12 documented verbs', () => {
+test('the tool registry is exactly the 15 documented verbs', () => {
   const expected = [
     'list_accounts', 'list_inbox', 'list_unread', 'get_chat', 'read_chat',
     'search_messages', 'send_message', 'note_to_self', 'react_to_message',
     'archive_chat', 'poll_messages', 'download_asset',
+    'send_draft', 'list_labels', 'update_label',
   ].sort();
   assert.deepEqual([...S.TOOL_NAMES].sort(), expected);
 });
 
-// ── read-only surface (MCP_READ_ONLY=1) ───────────────────────────
-// The write set is exactly the 4 mutating verbs (the POST handlers). In
-// read-only mode those are hidden from tools/list AND rejected in callTool, so
-// the surface most agents see is precisely the 8 reads. Pin both here; the
-// runtime filter/reject behaviour is exercised end-to-end in
-// scripts/mcp-guard-check.sh's read-only boot mode.
-test('the write set is exactly the 4 mutating verbs', () => {
+// ── tool modes (MCP_TOOL_MODE) ────────────────────────────────────
+// Capability groups + the mode math. Groups are disjoint by safety class; a
+// mode's surface is the union of its groups, hidden from tools/list AND
+// rejected in callTool. Runtime filtering/rejection is exercised end-to-end in
+// scripts/mcp-guard-check.sh's boot modes; here we pin the membership so a
+// new tool can only land in exactly one group.
+test('tool groups are disjoint and cover the whole registry', () => {
+  const g = S.TOOL_GROUPS;
+  const all = [...g.read, ...g.selfWrite, ...g.outboundWrite, ...g.labelWrite];
+  assert.equal(new Set(all).size, all.length, 'groups must be disjoint');
+  assert.deepEqual([...all].sort(), [...S.TOOL_NAMES].sort(), 'groups must cover TOOLS');
+});
+
+test('the send-capable write set is the 5 outward/self-send verbs', () => {
   assert.deepEqual(
     [...S.WRITE_TOOL_NAMES].sort(),
-    ['archive_chat', 'note_to_self', 'react_to_message', 'send_message'],
+    ['archive_chat', 'note_to_self', 'react_to_message', 'send_draft', 'send_message'],
+    'selfWrite + outboundWrite',
   );
 });
 
-test('the read-only surface is exactly the 8 read verbs', () => {
-  const expected = [
-    'list_accounts', 'list_inbox', 'list_unread', 'get_chat', 'read_chat',
-    'search_messages', 'poll_messages', 'download_asset',
-  ].sort();
-  assert.deepEqual([...S.READ_TOOL_NAMES].sort(), expected);
+test('allowedSetForMode: each mode surface is exactly its groups', () => {
+  const g = S.TOOL_GROUPS;
+  const ro = S.allowedSetForMode('read-only');
+  assert.deepEqual([...ro].sort(), [...g.read].sort());
+  const notes = S.allowedSetForMode('notes');
+  assert.deepEqual([...notes].sort(), [...g.read, ...g.selfWrite].sort());
+  const labels = S.allowedSetForMode('labels');
+  assert.deepEqual([...labels].sort(), [...g.read, ...g.labelWrite].sort());
+  const rw = S.allowedSetForMode('read-write');
+  assert.equal(rw.size, S.TOOL_NAMES.length);
+  assert.equal(S.allowedSetForMode('bogus'), null, 'unknown mode ⇒ null (caller fails closed)');
+});
+
+test('this test process booted read-write with no label scope (defaults)', () => {
+  assert.equal(S.MODE, 'read-write');
+  assert.deepEqual(S.LABEL_ALLOW, []);
+});
+
+// ── label plumbing (parse + scope) ────────────────────────────────
+// getLabelData reads /v1/accounts for the matrix user then the
+// com.beeper.labels account-data event. Stub the fetch by URL so both calls
+// resolve, and pin: parsing, room index, scope set math, and fail-closed.
+function stubLabelApi({ labels, matrixUser = '@t:beeper.com', accountsErr = false }) {
+  global.fetch = async (url) => {
+    if (String(url).includes('/v1/accounts')) {
+      if (accountsErr) return { ok: false, status: 500, text: async () => 'syncing' };
+      return { ok: true, status: 200, text: async () => JSON.stringify(
+        [{ accountID: 'matrix', network: 'Beeper', user: { id: matrixUser } }]) };
+    }
+    if (String(url).includes('/account_data/')) {
+      if (labels === null) return { ok: false, status: 404, text: async () => 'No account data event found with type "com.beeper.labels"' };
+      return { ok: true, status: 200, text: async () => JSON.stringify(labels) };
+    }
+    throw new Error('unexpected fetch: ' + url);
+  };
+}
+const LABELS_FIXTURE = {
+  'aaa-111': { title: 'Work', rooms: ['!w1:beeper.local', '!s1:beeper.local'], createdAt: 1, isShownInInbox: true },
+  'bbb-222': { title: 'Claws 🦞', rooms: ['!tg1:ba_x.local-telegram.localhost'], createdAt: 2, isShownInInbox: true },
+};
+
+test('getLabelData: parses defs + builds the room index', async () => {
+  S._resetLabelCache(); S._setLabelScope([]);
+  global.fetch = REAL_FETCH;
+  stubLabelApi({ labels: LABELS_FIXTURE });
+  try {
+    const d = await S.getLabelData({ strict: true, fresh: true });
+    assert.deepEqual(d.defs.map((l) => l.title).sort(), ['Claws 🦞', 'Work']);
+    assert.deepEqual(d.byRoom['!w1:beeper.local'], ['Work']);
+    assert.deepEqual(d.byRoom['!tg1:ba_x.local-telegram.localhost'], ['Claws 🦞']);
+    assert.equal(d.userId, '@t:beeper.com');
+  } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); }
+});
+
+test('scopedRoomSet: title match is case-insensitive; ids also work', async () => {
+  S._resetLabelCache();
+  stubLabelApi({ labels: LABELS_FIXTURE });
+  try {
+    S._setLabelScope(['work']);
+    let rooms = await S.scopedRoomSet();
+    assert.deepEqual([...rooms].sort(), ['!s1:beeper.local', '!w1:beeper.local']);
+    S._setLabelScope(['bbb-222']);
+    rooms = await S.scopedRoomSet();
+    assert.deepEqual([...rooms], ['!tg1:ba_x.local-telegram.localhost']);
+    S._setLabelScope([]);
+    assert.equal(await S.scopedRoomSet(), null, 'empty scope ⇒ null (unrestricted)');
+  } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); S._setLabelScope([]); }
+});
+
+test('scopedRoomSet: fails closed when labels are unreachable', async () => {
+  S._resetLabelCache(); S._setLabelScope(['Work']);
+  stubLabelApi({ labels: LABELS_FIXTURE, accountsErr: true });
+  try {
+    await assert.rejects(() => S.scopedRoomSet(), /labels unavailable|beeper api/);
+  } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); S._setLabelScope([]); }
+});
+
+test('getLabelData: missing label event reads as zero labels, not an error', async () => {
+  S._resetLabelCache(); S._setLabelScope([]);
+  stubLabelApi({ labels: null });
+  try {
+    const d = await S.getLabelData({ strict: true, fresh: true });
+    assert.deepEqual(d.defs, []);
+  } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); }
 });
 
 // ── lite-mode bind is loopback by default (security) ──────────────

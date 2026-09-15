@@ -36,12 +36,12 @@ For stdio transport (Claude Code, Cursor, Cline, Continue, [bareagent](https://n
 BEEPER_TOKEN=your-token-here npx beeperbox --stdio
 ```
 
-## The 12 tools
+## The 15 tools
 
 One opinionated MCP verb layer over Beeper — every tool returns a normalized `Chat` / `Message` schema, propagates `chat_id` + `network` onto every message, and is documented in-schema for the model. Reach across all 50+ networks without knowing which bridge you're talking to.
 
-- **Read / triage** — `list_accounts` · `list_inbox` · `list_unread` · `get_chat` · `read_chat` · `search_messages`
-- **Write / act** — `send_message` · `note_to_self` · `react_to_message` · `archive_chat`
+- **Read / triage** — `list_accounts` · `list_inbox` · `list_unread` · `get_chat` · `read_chat` · `search_messages` · `list_labels`
+- **Write / act** — `send_message` · `note_to_self` · `react_to_message` · `archive_chat` · `send_draft` (pre-fills the human's composer, never sends) · `update_label` (private cross-platform chat labels)
 - **Watch / reach** — `poll_messages` (read-only watch primitive, restart-safe cursor, `source` echo-guard) · `download_asset` (attachment bytes; every message carries `attachments[]`)
 
 Full schemas and usage in the [main README](https://github.com/hamr0/beeperbox#the-mcp).
@@ -56,6 +56,8 @@ Full schemas and usage in the [main README](https://github.com/hamr0/beeperbox#t
 | `MCP_AUTH_TOKEN` | Optional bearer guard on the MCP endpoint | unset (open on loopback) |
 | `MCP_ALLOWED_HOSTS` | Host/Origin allowlist | `localhost,127.0.0.1,::1` |
 | `MCP_BIND_ADDR` | Interface the MCP server binds | `127.0.0.1` (loopback) |
+| `MCP_TOOL_MODE` | Capability surface: `read-only` \| `notes` \| `labels` \| `read-write` (see [Tool modes](https://github.com/hamr0/beeperbox/blob/master/docs/GUIDE.md#tool-modes--label-scoping)) | `read-write` (legacy `MCP_READ_ONLY=1` ⇒ `read-only`) |
+| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids restricting every chat-bearing verb | unset (no restriction) |
 
 ## Security
 
