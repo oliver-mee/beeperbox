@@ -31,7 +31,13 @@ services:
       - "127.0.0.1:${BEEPERBOX_NOVNC_PORT:-6080}:6080"
       - "127.0.0.1:${BEEPERBOX_HOST_PORT:-23373}:23380"
       # MCP split: :23375 read-only (most agents), :23376 read-write (gated few).
+      # Read-only port is additionally bound to the Meshnet address so other
+      # fleet boxes can reach it, and fronted by beeper.ome.hk via cloudflared
+      # for off-fleet clients (Claude web). Both paths are bearer-gated by
+      # MCP_READ_TOKEN — that token is the ONLY auth on them. The read-WRITE
+      # port and noVNC stay loopback-only, deliberately.
       - "127.0.0.1:${BEEPERBOX_MCP_PORT:-23375}:23375"
+      - "100.115.148.57:${BEEPERBOX_MCP_PORT:-23375}:23375"
       - "127.0.0.1:${BEEPERBOX_MCP_WRITE_PORT:-23376}:23376"
     environment:
       # Bearer token for the Beeper Desktop API. Created in Beeper's
