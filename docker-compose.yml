@@ -54,8 +54,17 @@ services:
       # (docker exec -i … --stdio) is local-only and unaffected. Host/Origin are
       # always validated against loopback to block DNS-rebinding; set
       # MCP_ALLOWED_HOSTS for a reverse proxy (e.g. MCP_ALLOWED_HOSTS=mcp.example.com).
-      MCP_READ_TOKEN: ${MCP_READ_TOKEN:-}     # gates :23375 (read-only)
+      MCP_READ_TOKEN: ${MCP_READ_TOKEN:-}     # gates :23375 (default instance)
       MCP_WRITE_TOKEN: ${MCP_WRITE_TOKEN:-}   # gates :23376 (read-write)
+      # Capability of the :23375 instance: read-only | notes | labels |
+      # read-write (see docs/GUIDE.md "Tool modes"). `notes` = reads +
+      # note_to_self + send_draft, never a third-party send. The :23376
+      # instance is always full read-write and stays loopback-only.
+      MCP_TOOL_MODE_READ: ${MCP_TOOL_MODE_READ:-read-only}
+      # Optional chat filter for :23375 — comma-separated Beeper label
+      # titles/ids; the instance then only sees/touches chats carrying one of
+      # them (fail-closed; note_to_self exempt). Empty = unrestricted.
+      MCP_LABEL_ALLOW_READ: ${MCP_LABEL_ALLOW_READ:-}
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
       # Optional password for the noVNC/VNC session (:6080). When set, x11vnc
       # requires VNC authentication instead of serving an open session. Leave
