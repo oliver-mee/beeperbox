@@ -10,7 +10,7 @@
 beeperbox is a headless [Beeper Desktop](https://www.beeper.com/) in a Docker container that exposes **two things to agents**:
 
 1. **Raw Beeper Desktop HTTP API** on `127.0.0.1:23373` — the unmodified `/v1/*` endpoints for callers who want full control.
-2. **Opinionated Model Context Protocol server** on `127.0.0.1:23375` (HTTP) or stdio — 12 semantic tools, normalized `Chat` / `Message` schemas, note-to-self isolation, clean network slugs. Consume from Claude Code, Cursor, Cline, Continue, bareagent, or any other MCP-speaking runtime.
+2. **Opinionated Model Context Protocol server** on `127.0.0.1:23375` (HTTP) or stdio — 15 semantic tools, normalized `Chat` / `Message` schemas, note-to-self isolation, clean network slugs, per-instance capability modes and label scoping. Consume from Claude Code, Cursor, Cline, Continue, bareagent, or any other MCP-speaking runtime.
 
 Agents that consume beeperbox get read/write access to **every bridge the user's Beeper account has connected**: WhatsApp, iMessage, Signal, Discord, Slack, Telegram, Facebook Messenger, Instagram, LinkedIn, Google Messages, Matrix, and any future Beeper bridge. One config, every messenger.
 
@@ -42,8 +42,11 @@ docker run -d \
 | Search all chats for a keyword | `search_messages` |
 | Record a self-note that doesn't pollute the inbox | `note_to_self` |
 | Move a handled chat out of the inbox | `archive_chat` |
+| Propose a reply for a human to review and send (never sends) | `send_draft` |
+| See the user's labels (cross-platform chat folders) | `list_labels` |
+| Create/rename a label or move chats between them | `update_label` |
 
-The raw HTTP API (`http://localhost:23373/v1/*`) exposes ~20 more operations — reminders, asset upload/download, contacts, chat search, edit/delete messages, focus control. Use the MCP tools for everything that has one; fall back to raw HTTP for the long tail.
+The raw HTTP API (`http://localhost:23373/v1/*`) exposes dozens more operations — reminders, asset upload/download, contacts, chat search, edit/delete messages, focus control, Matrix account data. Use the MCP tools for everything that has one; fall back to raw HTTP for the long tail (or the official `beeper` CLI, which wraps most of it).
 
 ## Minimal wiring: stdio transport (recommended for agent runtimes)
 
@@ -239,6 +242,27 @@ Download a message attachment's bytes and return them base64-encoded — the MCP
 **Note:** The bytes ride base64 inside the JSON-RPC result, so the asset is capped at `BEEPERBOX_MAX_ASSET_BYTES` (default 8 MiB) — an oversized file returns a clear error, not a truncated body. Internally proxies `GET /v1/assets/serve?url=…`, so a remote deployment publishing only `:23375` can still read attachments. Raise the cap or hit `serve` directly for larger files.
 **Security:** `src_url` is confined to real attachments — `mxc://` / `localmxc://`, or a `file://` URL inside Beeper's media cache (`BEEPERBOX_ASSET_FILE_ROOT`, default `/root/.config/BeeperTexts/media/`); any other path, scheme, URL host, or encoded-`../` traversal is refused before the fetch. This is defense-in-depth — Beeper's own `serve` independently `403`s/`400`s those — so a caller can't turn `download_asset` into an arbitrary-file reader even if the upstream guard regresses.
 
+### `send_draft`
+
+Pre-fills a chat's **composer** with text via the Desktop API's draft input — the human sees it in Beeper Desktop/mobile, edits or fires or deletes it. Nothing is sent; this is the human-in-the-loop approval primitive for agents that may compose but must not send (see `MCP_TOOL_MODE=notes`).
+
+**Arguments:** `{chat_id: string, text?: string, clear?: boolean = false, client_tag?: string}`. A new draft is only accepted while the chat's draft box is empty (Beeper-side constraint) — `clear: true` empties it first. Drafted text is recorded in the sent ledger, so if the human fires it, the read-back still tags `source: "api"`.
+**Returns:** `{chat_id, action: "drafted"|"cleared", draft, sent: false, client_tag}`.
+
+### `list_labels`
+
+Reads the user's Beeper **labels** — private cross-platform chat folders stored as Matrix account data (`com.beeper.labels`), invisible to any contact.
+
+**Arguments:** none.
+**Returns:** `{instance_label_scope, labels: [{label_id, title, chat_count, chats: [{chat_id, in_instance_scope}]}]}` — including, when `MCP_LABEL_ALLOW` is set, which chats this instance may touch.
+
+### `update_label`
+
+Add chats to / remove chats from one label, create a label (unknown title + `add_chat_ids`), or rename it. Merges against the live account-data event immediately before writing (whole-event PUT, last-write-wins vs concurrent Desktop edits). Chat ids outside an active `MCP_LABEL_ALLOW` scope are refused.
+
+**Arguments:** `{title: string, label_id?: string, add_chat_ids?: string[], remove_chat_ids?: string[], rename?: string, show_in_inbox?: boolean = true}`.
+**Returns:** `{label_id, title, added, removed, chat_count}`.
+
 ## Schemas
 
 Two normalized shapes. Learn them once and every tool returns the same thing.
@@ -254,9 +278,12 @@ Two normalized shapes. Learn them once and every tool returns the same thing.
   "is_group": false,
   "is_note_to_self": false,
   "last_message_at": "2026-04-13T09:30:00Z",
-  "unread_count": 2
+  "unread_count": 2,
+  "labels": ["Work"]
 }
 ```
+
+`labels` is present only when the instance runs with `MCP_LABEL_ALLOW` set (the chats it returns are pre-filtered to that scope and carry their label titles here).
 
 | Field | Purpose |
 |---|---|
@@ -377,22 +404,28 @@ Tool errors are returned as JSON-RPC error objects, not thrown. The LLM should r
 
 | Env var | Effect | Default |
 |---|---|---|
-| `MCP_AUTH_TOKEN` | When set, every HTTP request must send `Authorization: Bearer <token>` or get `401`. | unset (open) |
+| `MCP_AUTH_TOKEN` | When set, every HTTP request must send `Authorization: Bearer *** or get `401`. | unset (open) |
 | `MCP_ALLOWED_HOSTS` | Comma-separated `Host`/`Origin` allowlist. Blocks DNS-rebinding (`403` on a non-allowlisted `Host`) and cross-origin browser calls (`403` on a non-allowlisted `Origin`). Set this to your hostname when running behind a reverse proxy. | `localhost,127.0.0.1,::1,[::1]` |
 | `MCP_MAX_BODY` | Max request body bytes; larger bodies abort `413`. | `1048576` (1 MiB) |
+| `MCP_TOOL_MODE` | Capability surface for the instance: `read-only` \| `notes` (reads + `note_to_self`/`send_draft`) \| `labels` (reads + `update_label`) \| `read-write`. Non-selected tools are hidden from `tools/list` AND rejected in `tools/call`. Unknown mode fails closed to `read-only`. | `read-write` (legacy `MCP_READ_ONLY=1` ⇒ `read-only`) |
+| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids: the instance only sees and touches chats carrying one of them — listings, search hits, reads, and writes all enforce it, fail-closed if labels are unresolvable. `note_to_self` exempt. Chats gain `labels[]` when set. | unset (no restriction) |
 
-The listener stays bound to `0.0.0.0` inside the container on purpose — a Docker published port is unreachable if the in-container process binds `127.0.0.1`. Auth + Host/Origin validation are the defense, not the bind address. For an agent that reaches the HTTP transport across hosts, set `MCP_AUTH_TOKEN` and send it as a bearer header.
+The listener stays bound to `0.0.0.0` inside the container on purpose — a Docker published port is unreachable if the in-container process binds `127.0.0.1`. Auth + Host/Origin validation are the defense, not the bind address. For an agent that reaches the HTTP transport across hosts, set `MCP_AUTH_TOKEN` and send it as a bearer header. In the container deployment, `entrypoint.sh` runs the `:23375` instance with `MCP_TOOL_MODE`/`MCP_LABEL_ALLOW` from the `MCP_TOOL_MODE_READ` / `MCP_LABEL_ALLOW_READ` compose vars (default `read-only`) and the `:23376` instance always `read-write`, loopback-only.
 
 ### Read-only vs read-write tokens
 
-Beeper's token creation UI has an **"Allow sensitive actions"** toggle that gates write operations — you do not need a special beeperbox flag for this, the scope is enforced inside Beeper Desktop itself.
+Two layers give least-privilege, and they compose:
 
-| Token scope | Allowed tools | Denied tools |
-|---|---|---|
-| **Read + write** (Allow sensitive actions: **on**) | all 11 | none |
-| **Read only** (Allow sensitive actions: **off**) | `list_accounts`, `list_inbox`, `list_unread`, `poll_messages`, `get_chat`, `read_chat`, `search_messages` | `send_message`, `note_to_self`, `react_to_message`, `archive_chat` (all return `-32001` / `401 Unauthorized`) |
+1. **Beeper's own token scope.** The Desktop token creation UI has an **"Allow sensitive actions"** toggle that gates write operations *inside Beeper Desktop itself* — a token minted without it cannot POST sends/reactions/archives even against the raw API.
 
-Use this for least-privilege agents: give a monitoring or summarization agent a read-only token so a prompt-injection attack cannot make it send messages.
+   | Token scope | Denied raw operations (HTTP `401`) |
+   |---|---|
+   | **Read + write** (Allow sensitive actions: **on**) | none |
+   | **Read only** (Allow sensitive actions: **off**) | sending, reactions, archive, and other mutating `POST`/`PATCH`/`PUT` paths |
+
+2. **beeperbox tool modes** (`MCP_TOOL_MODE` above) — which the *MCP surface* exposes, independent of the underlying token. A `notes` instance can draft and self-note but has no tool that could reach a third party even if the Beeper token were fully scoped.
+
+Use both for least-privilege agents: a monitoring or summarization agent gets a mode-gated instance (and optionally a read-only Beeper token), so a prompt-injection attack cannot make it send.
 
 ### Multi-tenancy
 
