@@ -36,10 +36,32 @@ Verified facts:
   with empty `{}` content the label still lists in `/v1/labels`, but no chat
   reports carrying it (the `labels[]` projection stays null). Always seed
   `via`.
-- **Children can only be seeded at creation.** The state proxy is GET-only
-  (`PUT /_matrix/client/v3/rooms/{id}/state/...` → 404), so there is no API
-  path to add or remove a chat from an existing official label. Edit roster =
-  recreate a fresh space with the full roster and `leave` the old one.
+- **The Desktop API proxy is the limitation, not Matrix.** Its
+  `PUT /_matrix/client/v3/rooms/{id}/state/...` route returns 404, so the
+  official Desktop API and the current `beeper` CLI cannot append/remove
+  children from an existing label. But the underlying Matrix homeserver
+  (`https://matrix.beeper.com`) accepts the standard Matrix state write when
+  called with the native Matrix access token:
+
+  ```
+  PUT /_matrix/client/v3/rooms/{label-space-id}/state/m.space.child/{chat-room-id}
+  {"via": ["beeper.com"]}
+  ```
+
+  This returned 200 and the child immediately appeared in `Chat.labels[]`.
+  To remove it, write an empty `{}` content to the same state-event path; the
+  event remains as an empty state event and the child stops projecting as a
+  label member. The homeserver enforces normal room permissions (the owner
+  needs sufficient state-event power level). We reverted the live probe and
+  restored `Preface AI` to 46 children.
+
+  Therefore roster edits do **not** require leave+recreate if we can reach the
+  homeserver with the Matrix token. The limitation is credential/API
+  plumbing: the Desktop API exposes the token-backed account but does not
+  proxy this write, and the CLI has no label command or generic Matrix-state
+  command. `beeperbox` currently has the token in the bundled Desktop
+  account database, but extracting/using that token from the MCP layer would
+  be a separate security-sensitive feature; do not expose it to agents.
 - Do not send an explicit `m.room.power_levels` in `initial_state` — the proxy
   500s with "Creator user must not appear in content.users"; the default PLs
   from `preset: private_chat` already give the owner 100.
