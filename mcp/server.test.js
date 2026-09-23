@@ -462,23 +462,47 @@ test('this test process booted read-write with no label scope (defaults)', () =>
 });
 
 // ── label plumbing (parse + scope) ────────────────────────────────
-// getLabelData reads /v1/accounts for the matrix user then the
-// com.beeper.labels account-data event. Stub the fetch by URL so both calls
-// resolve, and pin: parsing, room index, scope set math, and fail-closed.
-function stubLabelApi({ labels, matrixUser = '@t:beeper.com', accountsErr = false }) {
+// getLabelData reads /v1/accounts for the matrix user, the com.beeper.labels
+// account-data event (legacy store), AND the joined official-label spaces.
+// Stub the fetch by URL so all calls resolve, and pin: parsing, room index,
+// scope set math across BOTH systems, the update_label official refusal, and
+// fail-closed.
+function stubLabelApi({ labels, matrixUser = '@t:beeper.com', accountsErr = false, spaces = {} }) {
+  // spaces: { '!spaceid:beeper.com': { name, children:[...], plain?: bool } }
   global.fetch = async (url) => {
-    if (String(url).includes('/v1/accounts')) {
+    const u = String(url);
+    if (u.includes('/v1/accounts')) {
       if (accountsErr) return { ok: false, status: 500, text: async () => 'syncing' };
       return { ok: true, status: 200, text: async () => JSON.stringify(
         [{ accountID: 'matrix', network: 'Beeper', user: { id: matrixUser } }]) };
     }
-    if (String(url).includes('/account_data/')) {
+    if (u.includes('/joined_rooms')) {
+      const ids = Object.keys(spaces).concat(Object.keys(spaces).length ? ['!plainroom:x'] : []);
+      return { ok: true, status: 200, text: async () => JSON.stringify({ joined_rooms: ids }) };
+    }
+    if (u.includes('/state')) {
+      const m = u.match(/\/rooms\/([^/]+)\/state/);
+      const rid = m && decodeURIComponent(m[1]);
+      const sp = rid && spaces[rid];
+      if (!sp) return { ok: true, status: 200, text: async () => JSON.stringify(
+        [{ type: 'm.room.create', content: { type: sp ? 'm.space' : undefined } }]) };
+      const evs = [
+        { type: 'm.room.create', content: sp.plain ? { type: 'm.space' } : { type: 'm.space', 'com.beeper.label': true } },
+        { type: 'm.room.name', content: { name: sp.name } },
+        ...sp.children.map((c) => ({ type: 'm.space.child', state_key: c, content: { via: ['beeper.com'] } })),
+      ];
+      return { ok: true, status: 200, text: async () => JSON.stringify(evs) };
+    }
+    if (u.includes('/account_data/')) {
       if (labels === null) return { ok: false, status: 404, text: async () => 'No account data event found with type "com.beeper.labels"' };
       return { ok: true, status: 200, text: async () => JSON.stringify(labels) };
     }
     throw new Error('unexpected fetch: ' + url);
   };
 }
+const SPACES_FIXTURE = {
+  '!off1:beeper.com': { name: 'Official Work', children: ['!o1:beeper.local', '!o2:beeper.local'] },
+};
 const LABELS_FIXTURE = {
   'aaa-111': { title: 'Work', rooms: ['!w1:beeper.local', '!s1:beeper.local'], createdAt: 1, isShownInInbox: true },
   'bbb-222': { title: 'Claws 🦞', rooms: ['!tg1:ba_x.local-telegram.localhost'], createdAt: 2, isShownInInbox: true },
@@ -526,6 +550,50 @@ test('getLabelData: missing label event reads as zero labels, not an error', asy
   try {
     const d = await S.getLabelData({ strict: true, fresh: true });
     assert.deepEqual(d.defs, []);
+  } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); }
+});
+
+test('getLabelData: merges official label spaces with legacy defs, tagged by source', async () => {
+  S._resetLabelCache(); S._setLabelScope([]);
+  stubLabelApi({ labels: LABELS_FIXTURE, spaces: SPACES_FIXTURE });
+  try {
+    const d = await S.getLabelData({ strict: true, fresh: true });
+    const byTitle = Object.fromEntries(d.defs.map((l) => [l.title, l]));
+    assert.deepEqual(Object.keys(byTitle).sort(), ['Claws 🦞', 'Official Work', 'Work']);
+    assert.equal(byTitle['Official Work'].source, 'official');
+    assert.equal(byTitle['Official Work'].label_id, '!off1:beeper.com');
+    assert.equal(byTitle['Work'].source, 'legacy');
+    assert.deepEqual(byTitle['Official Work'].rooms, ['!o1:beeper.local', '!o2:beeper.local']);
+    assert.deepEqual(d.byRoom['!o1:beeper.local'], ['Official Work']);
+    assert.deepEqual(d.byRoom['!w1:beeper.local'], ['Work']);
+  } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); }
+});
+
+test('scopedRoomSet: an official-space title scopes to its children', async () => {
+  S._resetLabelCache();
+  stubLabelApi({ labels: LABELS_FIXTURE, spaces: SPACES_FIXTURE });
+  try {
+    S._setLabelScope(['official work']);
+    const rooms = await S.scopedRoomSet();
+    assert.deepEqual([...rooms].sort(), ['!o1:beeper.local', '!o2:beeper.local']);
+    // legacy + official titles union when both named
+    S._setLabelScope(['official work', 'Work']);
+    const both = await S.scopedRoomSet();
+    assert.deepEqual([...both].sort(), ['!o1:beeper.local', '!o2:beeper.local', '!s1:beeper.local', '!w1:beeper.local']);
+    S._setLabelScope([]);
+  } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); S._setLabelScope([]); }
+});
+
+test('update_label: refuses official labels loudly (no ghost legacy row)', async () => {
+  S._resetLabelCache(); S._setLabelScope([]);
+  stubLabelApi({ labels: LABELS_FIXTURE, spaces: SPACES_FIXTURE });
+  try {
+    await assert.rejects(
+      () => S.callTool('update_label', { title: 'Official Work', add_chat_ids: ['!w1:beeper.local'] }),
+      (e) => /OFFICIAL Beeper label/.test(e.message));
+    await assert.rejects(
+      () => S.callTool('update_label', { title: 'Whatever', label_id: '!off1:beeper.com', add_chat_ids: ['!w1:beeper.local'] }),
+      (e) => /OFFICIAL Beeper label/.test(e.message));
   } finally { global.fetch = REAL_FETCH; S._resetLabelCache(); }
 });
 

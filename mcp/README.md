@@ -57,7 +57,7 @@ Full schemas and usage in the [main README](https://github.com/hamr0/beeperbox#t
 | `MCP_ALLOWED_HOSTS` | Host/Origin allowlist | `localhost,127.0.0.1,::1` |
 | `MCP_BIND_ADDR` | Interface the MCP server binds | `127.0.0.1` (loopback) |
 | `MCP_TOOL_MODE` | Capability surface: `read-only` \| `notes` \| `labels` \| `read-write` (see [Tool modes](https://github.com/hamr0/beeperbox/blob/master/docs/GUIDE.md#tool-modes--label-scoping)) | `read-write` (legacy `MCP_READ_ONLY=1` ⇒ `read-only`) |
-| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids restricting every chat-bearing verb | unset (no restriction) |
+| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids restricting every chat-bearing verb; matches BOTH label systems (official app spaces + legacy account-data) | unset (no restriction) |
 
 ## Security
 

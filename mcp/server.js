@@ -118,9 +118,12 @@ if (!ALLOWED_TOOLS) {
 // label ids) restricts this instance to chats carrying at least one of those
 // labels. Applies to every chat-bearing verb: inbox/unread listings are
 // filtered, get/read/search/poll only see in-scope chats, and the write verbs
-// (send/react/archive/draft) refuse out-of-scope chat_ids. Labels are the
-// user's cross-platform grouping (Matrix account data com.beeper.labels), so
-// one scope covers WhatsApp + Slack + Telegram chats at once. Unset ⇒ no
+// (send/react/archive/draft) refuse out-of-scope chat_ids. Labels cover BOTH
+// Beeper label systems: the legacy Matrix account-data event
+// (com.beeper.labels) and OFFICIAL labels (m.space rooms flagged
+// com.beeper.label:true — the ones the Desktop app renders). Titles match
+// case-insensitively across both stores and the scopes union, so a scope can
+// name whichever kind you curate. One scope covers WhatsApp + Slack + Telegram chats at once. Unset ⇒ no
 // restriction. Fails closed: if a scope is configured but labels cannot be
 // resolved (Beeper syncing, no matrix account), chat verbs error rather than
 // leak the full inbox. note_to_self is exempt (recipient is auto-resolved to
@@ -169,11 +172,58 @@ async function getLabelData(opts = {}) {
   for (const [id, v] of Object.entries(defsRaw && typeof defsRaw === 'object' ? defsRaw : {})) {
     if (!v || typeof v !== 'object' || !Array.isArray(v.rooms)) continue;
     const title = String(v.title ?? '(untitled)');
-    defs.push({ label_id: id, title, rooms: v.rooms });
+    defs.push({ label_id: id, title, rooms: v.rooms, source: 'legacy' });
     for (const r of v.rooms) (byRoom[r] = byRoom[r] || []).push(title);
+  }
+  // Official labels (the ones the app renders) are Matrix spaces flagged
+  // com.beeper.label:true in their m.room.create content — discovery lives in
+  // fetchOfficialLabelSpaces below. Scope and list_labels read BOTH systems:
+  // titles are matched case-insensitively across sources and the scopes union,
+  // so one MCP_LABEL_ALLOW title works whether the label is a legacy
+  // account-data entry or an official space. A space-fetch failure is a
+  // strict-mode error (fail closed: an unreachable official-label set must
+  // never silently shrink the fence) and a logged no-op otherwise.
+  let spaces = [];
+  try {
+    spaces = await fetchOfficialLabelSpaces(userId);
+  } catch (err) {
+    if (opts.strict) throw rpcError(-32002, `official labels unavailable: ${err.message}`);
+    process.stderr.write(`[beeperbox-mcp] official-label fetch failed (non-strict): ${err.message}\n`);
+    const cachedSpaces = (labelCache?.defs || []).filter((d) => d.source === 'official');
+    spaces = cachedSpaces;
+  }
+  for (const s of spaces) {
+    if (s.label_id in defsRaw && defsRaw[s.label_id]?.rooms) continue; // paranoid dedupe
+    defs.push(s);
+    for (const r of s.rooms) if (!(byRoom[r] || []).includes(s.title)) (byRoom[r] = byRoom[r] || []).push(s.title);
   }
   labelCache = { defs, byRoom, userId, at: now };
   return labelCache;
+}
+
+// Enumerate joined rooms that are official Beeper labels: m.space rooms whose
+// m.room.create content carries com.beeper.label === true. Children are the
+// m.space.child state keys. Costs joined_rooms + one state fetch per joined
+// room; fine at personal-inbox scale (tens of rooms) and cached upstream by
+// LABEL_CACHE_TTL_MS.
+async function fetchOfficialLabelSpaces(userId) {
+  const out = [];
+  const joined = await beeperFetch('/_matrix/client/v3/joined_rooms');
+  const rooms = Array.isArray(joined?.joined_rooms) ? joined.joined_rooms : [];
+  for (const roomId of rooms) {
+    let state;
+    try {
+      state = await beeperFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state`);
+    } catch { continue; } // left/unreadable mid-sync: not a label we can scope by
+    const evs = Array.isArray(state) ? state : (state?.state || []);
+    const create = evs.find((e) => e.type === 'm.room.create');
+    if (create?.content?.type !== 'm.space' || create?.content?.['com.beeper.label'] !== true) continue;
+    const name = evs.find((e) => e.type === 'm.room.name')?.content?.name;
+    const kids = evs.filter((e) => e.type === 'm.space.child' && e.state_key)
+      .map((e) => e.state_key);
+    out.push({ label_id: roomId, title: String(name || '(untitled)'), rooms: kids, source: 'official' });
+  }
+  return out;
 }
 
 // The Set of room/chat ids this instance may touch, or null when unrestricted.
@@ -1397,6 +1447,7 @@ async function callTool(name, args) {
         labels: data.defs.map((l) => ({
           label_id: l.label_id,
           title: l.title,
+          source: l.source || 'legacy', // 'official' = app-visible Matrix space
           chat_count: l.rooms.length,
           chats: l.rooms.map((r) => ({
             chat_id: r,
@@ -1431,6 +1482,14 @@ async function callTool(name, args) {
         ? data.defs.find((l) => l.label_id === args.label_id)?.label_id
         : data.defs.find((l) => l.title.toLowerCase() === String(args.title).toLowerCase())?.label_id;
       if (args.label_id && !labelId) throw rpcError(-32004, `no label with id ${args.label_id}`);
+      // Official labels are Matrix spaces, not account-data rows: this tool
+      // cannot add/remove their children (state proxy is GET-only). Matching by
+      // room id or by an official title must refuse loudly — writing them into
+      // the legacy event would mint a ghost label the app never shows.
+      const target = labelId ? data.defs.find((l) => l.label_id === labelId) : null;
+      if (target?.source === 'official' || (labelId && labelId.startsWith('!'))) {
+        throw rpcError(-32602, `"${args.title || labelId}" is an OFFICIAL Beeper label (Matrix space). update_label only writes the legacy account-data store; official labels are edited in the app UI, or recreated via Matrix createRoom — see docs/labels.md.`);
+      }
       if (rems.length && !labelId) throw rpcError(-32004, `label "${args.title}" not found — nothing to remove`);
       if (args.rename && !labelId) throw rpcError(-32004, `label "${args.title}" not found — rename needs an existing label`);
       // Rebuild from the FRESH live event (never the parsed cache) so concurrent
@@ -1695,6 +1754,7 @@ module.exports = {
   _setLabelScope: (list) => { LABEL_ALLOW = Array.isArray(list) ? list.map(String) : []; },
   getLabelData,
   scopedRoomSet,
+  callTool,
   BIND_ADDR,
   ledgerPath,
   encodeCursor,

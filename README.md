@@ -117,7 +117,11 @@ BEEPER_TOKEN=your-token-here npx beeperbox --stdio
 | `MCP_ALLOWED_HOSTS` | Host/Origin allowlist | `localhost,127.0.0.1,::1` |
 | `MCP_BIND_ADDR` | Interface the MCP server binds | `127.0.0.1` (loopback) |
 | `MCP_TOOL_MODE` | Capability surface: `read-only` \| `notes` \| `labels` \| `read-write` | `read-write` (legacy `MCP_READ_ONLY=1` ⇒ `read-only`) |
-| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids restricting every chat-bearing verb | unset (no restriction) |
+| `MCP_LABEL_ALLOW` | Comma-separated Beeper label titles/ids restricting every chat-bearing verb; matches BOTH label systems (official app spaces + legacy account-data) | unset (no restriction) |
+
+See [docs/labels.md](docs/labels.md) for how Beeper's two label systems work
+(official labels are Matrix `m.space`s; legacy labels are account data) and
+what each MCP verb can and cannot write.
 
 **Security:** lite mode binds **loopback only** (`127.0.0.1`) by default, so it's safe with no auth — only processes on your machine (your agent, Claude Code) can reach it. Do **not** just flip it to `0.0.0.0`: a same-network attacker can spoof the `Host` header past the allowlist and reach the full tool surface (read every message, send across every network) unauthenticated. To expose it deliberately, set `MCP_BIND_ADDR=0.0.0.0` **and** `MCP_AUTH_TOKEN`, and front it with a tunnel (SSH / Tailscale / TLS reverse proxy) — never raw on a public interface. (The container binds `0.0.0.0` on purpose because Docker publishes it on `127.0.0.1` — that loopback *publish* is its boundary; lite mode has no such layer, which is why its *bind* is loopback.)
 
