@@ -167,9 +167,13 @@ union left via HS route; 404 after).
   `m.space.child` room. No duplicates, no cross-network fan-out.
 - The mechanism is `Chat.merge.defaultChatID` ("Member chat that receives
   messages sent to the merged chat, when the user has picked one" — spec).
-  API-created unions with no explicit default fall back to child order.
-  To message a specific member chat, address the child directly — union
-  rooms are an inbox convenience, not a send abstraction.
+  **Child order decides the default when none is stored: the FIRST
+  `m.space.child` wins** — proven by two createRoom probes with the same
+  pair of rooms in opposite orders (2026-09-23, both torn down). Neither
+  app-made (Abby) nor API-made (Sherman) unions persist a `defaultChatID`
+  in the API view or any account-data key found in the store. To send to a
+  specific member chat, address the child directly — union rooms are an
+  inbox convenience, not a send abstraction.
 - **Union timelines are UI-only.** `GET /v1/chats/{union}/messages` returns
   empty even for an app-made merge (Abby's: 0 msgs while its WhatsApp child
   has 20) — the merged scrollback the app renders is assembled client-side
