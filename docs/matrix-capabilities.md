@@ -152,11 +152,32 @@ account `matrix` / network "Beeper (Matrix)", type `single`.
   creation (app busy integrating the new room); the direct-homeserver
   route (matrix.beeper.com + native token) left it instantly. Prefer the
   HS route for union cleanup, or wait + retry the proxy.
-- **Unverified:** send fan-out semantics on a union room via
-  `POST /v1/chats/{union}/messages` (broadcast vs network-pick), and
-  whether children can be appended post-create via the HS state route
-  (labels prove the route; union probably identical — try on a probe
-  first).
+- Send routing + timeline semantics: see "Send routing on union rooms"
+  below (boundary-tested 2026-09-23).
+
+## Send routing on union rooms (boundary test, 2026-09-23)
+
+Live-tested with a throwaway union of two self-owned rooms (Note to self +
+Gary WA Hermes), then fully torn down (test message DELETEd 200 via
+`/v1/chats/{id}/messages/{msgID}` — documented redaction route works;
+union left via HS route; 404 after).
+
+- **`POST /messages` on a union room does NOT broadcast.** The API replies
+  `{"chatID": "<first-child>"}` and exactly one copy lands — in the first
+  `m.space.child` room. No duplicates, no cross-network fan-out.
+- The mechanism is `Chat.merge.defaultChatID` ("Member chat that receives
+  messages sent to the merged chat, when the user has picked one" — spec).
+  API-created unions with no explicit default fall back to child order.
+  To message a specific member chat, address the child directly — union
+  rooms are an inbox convenience, not a send abstraction.
+- **Union timelines are UI-only.** `GET /v1/chats/{union}/messages` returns
+  empty even for an app-made merge (Abby's: 0 msgs while its WhatsApp child
+  has 20) — the merged scrollback the app renders is assembled client-side
+  from the children. Agents must read children individually.
+- The app's data layer fully accepts API-made unions: children gained
+  `mergedIntoChatID` pointing back, union exposes `merge.chatIDs` —
+  structurally indistinguishable from in-app merges (verified on the real
+  Sherman union: WhatsApp DM + Google Chat DM).
 
 ## ctx7 recipes used (repeatable)
 
