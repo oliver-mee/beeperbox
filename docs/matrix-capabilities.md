@@ -109,7 +109,7 @@ allowance: `voice-transcription` 5, `scheduled-message` 5, `remind-later` 5,
 
 The critical distinction this exposes:
 
-- **Client-gated freebies** (labels, merged-chats, chat ordering, filters,
+- **Client-gated freebies** (labels, chat ordering, filters,
   auto-archive prefs, mutes): the limit lives in these locally-synced events
   and the app merely refuses in its UI. Data-plane access bypasses them
   entirely — which is exactly what happened with labels (six visible while
