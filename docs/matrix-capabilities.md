@@ -130,6 +130,34 @@ Beeper's cloud state. Everything above was read from local caches and
 round-tripped with identical-content PUTs; the only live writes made were
 the m.tag probe (reverted) and the label-space operations.
 
+## Merged chats = `com.beeper.union` rooms (verified 2026-09-23)
+
+Beeper's paid "merge chats" feature is the same data-plane trick as labels.
+A merged chat (e.g. Oliver's in-app "Abby Yuen 😊" merge of 4 rooms) is a
+Matrix room whose `m.room.create` content is
+`{"type": "com.beeper.union", "com.beeper.union": true}`; the merged source
+chats are `m.space.child` state events (`via: ["beeper.com"]`) exactly like
+label spaces. It projects into `/v1/chats` as a normal read-write chat on
+account `matrix` / network "Beeper (Matrix)", type `single`.
+
+- **Create works through the Desktop API proxy**: identical `createRoom`
+  call as labels but `creation_content.type: "com.beeper.union"` (+ the
+  `com.beeper.union: true` flag). A child-less probe chat surfaced via
+  `/v1/chats/search` immediately and was reverted.
+- **Quota theatre:** `com.beeper.freebie_usage` lists NO `merged-chats`
+  entry even after an in-app merge consumed the free plan's 1-merge
+  allowance — the client isn't even counting it. Like labels, the freebie
+  is `reversible: true`.
+- **Delete:** proxy `POST …/leave` hung repeatedly right after room
+  creation (app busy integrating the new room); the direct-homeserver
+  route (matrix.beeper.com + native token) left it instantly. Prefer the
+  HS route for union cleanup, or wait + retry the proxy.
+- **Unverified:** send fan-out semantics on a union room via
+  `POST /v1/chats/{union}/messages` (broadcast vs network-pick), and
+  whether children can be appended post-create via the HS state route
+  (labels prove the route; union probably identical — try on a probe
+  first).
+
 ## ctx7 recipes used (repeatable)
 
 `ctx7 library "matrix specification"` → `/matrix-org/matrix-spec`;
