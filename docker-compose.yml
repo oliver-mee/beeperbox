@@ -39,6 +39,11 @@ services:
       - "127.0.0.1:${BEEPERBOX_MCP_PORT:-23375}:23375"
       - "100.115.148.57:${BEEPERBOX_MCP_PORT:-23375}:23375"
       - "127.0.0.1:${BEEPERBOX_MCP_WRITE_PORT:-23376}:23376"
+      # Label-scoped work-agent instance (:23377): loopback + meshnet (the work
+      # agent may run on any fleet box), gated by MCP_WORK_TOKEN. Sees ONLY
+      # chats carrying MCP_LABEL_ALLOW_WORK; starts only if both are set.
+      - "127.0.0.1:${BEEPERBOX_MCP_WORK_PORT:-23377}:23377"
+      - "100.115.148.57:${BEEPERBOX_MCP_WORK_PORT:-23377}:23377"
     environment:
       # Bearer token for the Beeper Desktop API. Created in Beeper's
       # Settings -> Developers panel after first login. Required for
@@ -56,6 +61,14 @@ services:
       # MCP_ALLOWED_HOSTS for a reverse proxy (e.g. MCP_ALLOWED_HOSTS=mcp.example.com).
       MCP_READ_TOKEN: ${MCP_READ_TOKEN:-}     # gates :23375 (default instance)
       MCP_WRITE_TOKEN: ${MCP_WRITE_TOKEN:-}   # gates :23376 (read-write)
+      # Work-agent instance (:23377): MCP_WORK_TOKEN gates it and
+      # MCP_LABEL_ALLOW_WORK scopes it to chats carrying those label titles.
+      # Both required — entrypoint.sh fails closed (skips the instance) if the
+      # token is set without a scope. MCP_TOOL_MODE_WORK picks capability
+      # (read-only | notes | labels | read-write; default read-only).
+      MCP_WORK_TOKEN: ${MCP_WORK_TOKEN:-}
+      MCP_LABEL_ALLOW_WORK: ${MCP_LABEL_ALLOW_WORK:-}
+      MCP_TOOL_MODE_WORK: ${MCP_TOOL_MODE_WORK:-read-only}
       # Capability of the :23375 instance: read-only | notes | labels |
       # read-write (see docs/GUIDE.md "Tool modes"). `notes` = reads +
       # note_to_self + send_draft, never a third-party send. The :23376
