@@ -70,3 +70,70 @@ bypass).
 - **Genuinely app/cloud-side:** Send Later, Reminders (app timers; Reminders
   have a documented API endpoint but fire client-side), voice transcription
   (cloud), bridge/account entitlements (server-side auth).
+
+## The full private dictionary (Beeper store dump, 2026-09-23)
+
+`sqlite3 account.db` (in-container, read-only URI mode) `store` table caches
+EVERY global account-data event under `ad:<type>` keys. The complete list of
+what Beeper keeps as plain Matrix data on this account includes, beyond
+labels:
+
+| key | what it is | proxy write? |
+|---|---|---|
+| `com.beeper.auto_archive` | `{mode: "AfterResponding", delta_ms}` — Auto-Archive rule | ✓ (identical-PUT 200) |
+| `com.beeper.chatFilter` | the persisted inbox filter (e.g. `"unread"`) | ✓ |
+| `com.beeper.favourites_order` | **the pinned-chats ordering** (`Inbox: [room_ids]`) — complements `m.tag` order | ✓ |
+| `com.beeper.muted` | global mute list (`room_ids[]`) | ✓ |
+| `com.beeper.mark_read_when_archive` | `{enabled: true}` pref | ✓ (inferred) |
+| `com.beeper.reminder_settings` | `{archive_on_reminder_set: false}` pref | ✓ (inferred) |
+| `com.beeper.desktop.prefs` | the entire desktop UI pref blob (ai_engine, transcription_language, layout…) | ✓ (inferred) |
+| `com.beeper.labels` | legacy label store (see labels.md) | ✓ (proven) |
+| `com.beeper.freebie_usage` | **client-side quota counters** (see below) | ✓ (inferred) |
+| `com.beeper.feature_flags` | server-pushed flags incl. the freebie definitions | read |
+| `com.beeper.labs.tg_topics_as_spaces` / `.wa_communities_as_spaces` | lab toggles | ✓ (inferred) |
+| `m.direct` | DM map | ✓ route, don't disturb |
+| `im.vector.*`, `io.element.recent_emoji` | Element-inherited prefs | — |
+
+Per-room account data (local cache): `com.beeper.inbox.done` (the Done
+marking), `m.marked_unread`, `m.fully_read`, `m.tag`, per-room
+`m.push_rules`, `com.beeper.chats.auto_archive`. Room account_data write is
+proven (m.tag round-trip).
+
+### The freebie ledger — how Beeper's paywall actually works
+
+`feature_flags.freebies` defines every metered feature and its Free-plan
+allowance: `voice-transcription` 5, `scheduled-message` 5, `remind-later` 5,
+`blasts` 3, `labels` 1, `merged-chats` 1, `incognito` 3-day trial.
+`freebie_usage` on the account tracks consumption (`{"labels": {"limit": 1,
+"used": 1}, "voice-transcription": {"used": 5}}`).
+
+The critical distinction this exposes:
+
+- **Client-gated freebies** (labels, merged-chats, chat ordering, filters,
+  auto-archive prefs, mutes): the limit lives in these locally-synced events
+  and the app merely refuses in its UI. Data-plane access bypasses them
+  entirely — which is exactly what happened with labels (six visible while
+  `limit: 1`). `labels` even carries `"reversible": true` — the downgrade
+  path hides extras, never deletes them, confirming multi-label data is
+  supported by design.
+- **Server-gated freebies** (voice-transcription quota): the usage counter
+  is informational; the actual gate is Beeper's cloud API rejecting calls
+  past quota. Editing the local counter buys nothing.
+- **App-side features with local timers** (scheduled-message, remind-later):
+  the feature flag `blasts:false` and the 5-per-meter caps gate the UI; the
+  scheduling itself is app state. An agent replicating them is building its
+  own feature, not unlocking Beeper's (see the 2026-09-23 session log).
+
+Do NOT edit `freebie_usage` or `feature_flags` to fake entitlements — it
+proves nothing to server gates and risks desyncing the account against
+Beeper's cloud state. Everything above was read from local caches and
+round-tripped with identical-content PUTs; the only live writes made were
+the m.tag probe (reverted) and the label-space operations.
+
+## ctx7 recipes used (repeatable)
+
+`ctx7 library "matrix specification"` → `/matrix-org/matrix-spec`;
+`ctx7 docs /matrix-org/matrix-spec "<question>"` for power levels, space
+child semantics, redaction, tags, push rules. Cross-check every claim
+against the live proxy before trusting the spec — Beeper's Synapse fork
+implements exactly what it proxies and 404s the rest.
