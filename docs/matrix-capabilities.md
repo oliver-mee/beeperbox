@@ -144,10 +144,24 @@ account `matrix` / network "Beeper (Matrix)", type `single`.
   call as labels but `creation_content.type: "com.beeper.union"` (+ the
   `com.beeper.union: true` flag). A child-less probe chat surfaced via
   `/v1/chats/search` immediately and was reverted.
-- **Quota theatre:** `com.beeper.freebie_usage` lists NO `merged-chats`
-  entry even after an in-app merge consumed the free plan's 1-merge
-  allowance — the client isn't even counting it. Like labels, the freebie
-  is `reversible: true`.
+- **Quota: myth busted — NOT bypassable like labels** (corrected same day
+  via live multi-device test): on the Free-plan phone, only the one
+  in-app-created merge (Abby) renders as a merged chat; the API-created
+  unions (Sherman, Carmen) do not — despite their data being fully present
+  on matrix.beeper.com AND cached identically in the desktop DB (verified
+  by reading the worklaptop's account.db read-only: same 9-12 state events,
+  same union flag, same children, same membership). Beeper's paid merge
+  gating is therefore enforced at the **client render layer per feature**,
+  and the phone client honors the 1-merge limit where the label client
+  does not honor the 1-label limit. Desktop behaviour was inconsistent
+  (rendered a live-synced API union with the "Merged Chat" badge;
+  previously-synced unions vanished), which fits a client that special-cases
+  its own/just-processed unions rather than trusting stored state.
+- **What still works for agents regardless:** the headless instance's API
+  reads unions fine (`merge.chatIDs`, children's `mergedIntoChatID`), so
+  agent-side merging is a functional data structure even where the phone UI
+  won't show it. It is NOT a user-visible paywall bypass — do not sell it
+  as one.
 - **Delete:** proxy `POST …/leave` hung repeatedly right after room
   creation (app busy integrating the new room); the direct-homeserver
   route (matrix.beeper.com + native token) left it instantly. Prefer the
