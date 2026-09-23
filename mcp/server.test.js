@@ -468,7 +468,7 @@ test('this test process booted read-write with no label scope (defaults)', () =>
 // scope set math across BOTH systems, the update_label official refusal, and
 // fail-closed.
 function stubLabelApi({ labels, matrixUser = '@t:beeper.com', accountsErr = false, spaces = {} }) {
-  // spaces: { '!spaceid:beeper.com': { name, children:[...], plain?: bool } }
+  // spaces: { '!spaceid:beeper.com': { name, children:[...] } }
   global.fetch = async (url) => {
     const u = String(url);
     if (u.includes('/v1/accounts')) {
@@ -476,18 +476,17 @@ function stubLabelApi({ labels, matrixUser = '@t:beeper.com', accountsErr = fals
       return { ok: true, status: 200, text: async () => JSON.stringify(
         [{ accountID: 'matrix', network: 'Beeper', user: { id: matrixUser } }]) };
     }
-    if (u.includes('/joined_rooms')) {
-      const ids = Object.keys(spaces).concat(Object.keys(spaces).length ? ['!plainroom:x'] : []);
-      return { ok: true, status: 200, text: async () => JSON.stringify({ joined_rooms: ids }) };
+    if (u.includes('/v1/labels')) {
+      const list = Object.entries(spaces).map(([id, sp]) => ({ id, name: sp.name }));
+      return { ok: true, status: 200, text: async () => JSON.stringify(list) };
     }
     if (u.includes('/state')) {
       const m = u.match(/\/rooms\/([^/]+)\/state/);
       const rid = m && decodeURIComponent(m[1]);
       const sp = rid && spaces[rid];
-      if (!sp) return { ok: true, status: 200, text: async () => JSON.stringify(
-        [{ type: 'm.room.create', content: { type: sp ? 'm.space' : undefined } }]) };
+      if (!sp) return { ok: true, status: 200, text: async () => JSON.stringify([]) };
       const evs = [
-        { type: 'm.room.create', content: sp.plain ? { type: 'm.space' } : { type: 'm.space', 'com.beeper.label': true } },
+        { type: 'm.room.create', content: { type: 'm.space', 'com.beeper.label': true } },
         { type: 'm.room.name', content: { name: sp.name } },
         ...sp.children.map((c) => ({ type: 'm.space.child', state_key: c, content: { via: ['beeper.com'] } })),
       ];

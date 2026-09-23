@@ -201,27 +201,28 @@ async function getLabelData(opts = {}) {
   return labelCache;
 }
 
-// Enumerate joined rooms that are official Beeper labels: m.space rooms whose
-// m.room.create content carries com.beeper.label === true. Children are the
-// m.space.child state keys. Costs joined_rooms + one state fetch per joined
-// room; fine at personal-inbox scale (tens of rooms) and cached upstream by
-// LABEL_CACHE_TTL_MS.
-async function fetchOfficialLabelSpaces(userId) {
+// Enumerate official Beeper labels: GET /v1/labels lists them (projection of
+// the joined m.space rooms flagged com.beeper.label:true), and each label's
+// children are its room's m.space.child state keys. The Matrix joined_rooms
+// route is NOT proxied by the Desktop API (404), so /v1/labels is the only
+// discovery path; per-room state proxies fine for joined rooms. Costs one
+// list + one state fetch per label; cached upstream by LABEL_CACHE_TTL_MS.
+async function fetchOfficialLabelSpaces() {
+  const list = await beeperFetch('/v1/labels');
+  const entries = Array.isArray(list) ? list : (list?.labels || []);
   const out = [];
-  const joined = await beeperFetch('/_matrix/client/v3/joined_rooms');
-  const rooms = Array.isArray(joined?.joined_rooms) ? joined.joined_rooms : [];
-  for (const roomId of rooms) {
-    let state;
+  for (const lab of entries) {
+    const roomId = lab.id || lab.room_id || lab.label_id;
+    if (!roomId) continue;
+    let kids = [];
     try {
-      state = await beeperFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state`);
-    } catch { continue; } // left/unreadable mid-sync: not a label we can scope by
-    const evs = Array.isArray(state) ? state : (state?.state || []);
-    const create = evs.find((e) => e.type === 'm.room.create');
-    if (create?.content?.type !== 'm.space' || create?.content?.['com.beeper.label'] !== true) continue;
-    const name = evs.find((e) => e.type === 'm.room.name')?.content?.name;
-    const kids = evs.filter((e) => e.type === 'm.space.child' && e.state_key)
-      .map((e) => e.state_key);
-    out.push({ label_id: roomId, title: String(name || '(untitled)'), rooms: kids, source: 'official' });
+      const state = await beeperFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state`);
+      const evs = Array.isArray(state) ? state : (state?.state || []);
+      kids = evs.filter((e) => e.type === 'm.space.child' && e.state_key).map((e) => e.state_key);
+    } catch { /* state unreadable: keep the label with zero children — scoping
+                 to an empty set is fail-closed, and listing it keeps it visible
+                 to operators debugging why an instance sees nothing */ }
+    out.push({ label_id: roomId, title: String(lab.name || lab.title || '(untitled)'), rooms: kids, source: 'official' });
   }
   return out;
 }
