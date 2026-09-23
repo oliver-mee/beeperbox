@@ -121,7 +121,7 @@ BEEPER_TOKEN=your-token-here npx beeperbox --stdio
 
 See [docs/labels.md](docs/labels.md) for how Beeper's two label systems work
 (official labels are Matrix `m.space`s; legacy labels are account data) and
-what each MCP verb can and cannot write.
+what each MCP verb can and cannot write. [docs/matrix-capabilities.md](docs/matrix-capabilities.md) covers the other Matrix-native surfaces we verified (room tags = pins/low-priority, m.direct, push rules).
 
 **Security:** lite mode binds **loopback only** (`127.0.0.1`) by default, so it's safe with no auth — only processes on your machine (your agent, Claude Code) can reach it. Do **not** just flip it to `0.0.0.0`: a same-network attacker can spoof the `Host` header past the allowlist and reach the full tool surface (read every message, send across every network) unauthenticated. To expose it deliberately, set `MCP_BIND_ADDR=0.0.0.0` **and** `MCP_AUTH_TOKEN`, and front it with a tunnel (SSH / Tailscale / TLS reverse proxy) — never raw on a public interface. (The container binds `0.0.0.0` on purpose because Docker publishes it on `127.0.0.1` — that loopback *publish* is its boundary; lite mode has no such layer, which is why its *bind* is loopback.)
 
