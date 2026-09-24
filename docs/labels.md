@@ -1,5 +1,26 @@
 # Beeper labels: two systems, one scope
 
+## INCIDENT 2026-09-23 (late): headless lost space membership, fence degraded
+
+~20h after the dual-store work shipped cleanly, the beeperbox headless
+instance's Matrix session (same user_id `@olivermee:beeper.com`) reported
+`not in room` for BOTH label spaces (`Preface AI`, `Preface Public`):
+central `joined_rooms` (1575 rooms) lacks both space ids; proxy state reads
+500; direct HS reads 403; bare/via join attempts → `No known servers`/502.
+`docker restart` does not recover it. Side effects: the :23377 fence
+dropped from 12 chats to 5, while `list_labels` kept showing stale cached
+rosters (48) because the MCP process cache outlived the membership —
+display lied while enforcement silently degraded. The user's phone/desktop
+still see and edit the labels, and the per-chat `Chat.labels[]` projection
+on the headless still reports label membership — only direct space-room
+state reads fail. Root cause undetermined; the only known user action that
+day was changing label colors in the app (harmless-looking state writes;
+unproven trigger). Fix directions: recover/re-join membership if possible,
+else rebuild both spaces with full rosters via the createRoom recipe below
+and re-point MCP_LABEL_ALLOW titles; design flaw either way — the fence
+must ALSO derive rosters from the `Chat.labels[]` projection as fallback
+(see Paperclip issue, filed 2026-09-23, unassigned).
+
 Beeper has **two parallel label systems**. Both live inside the Matrix account
 Beeper hosts locally, and the Desktop API proxy (`:23373` on this box, token in
 `.env` → `BEEPER_TOKEN`) reaches both — but they behave differently. Everything
