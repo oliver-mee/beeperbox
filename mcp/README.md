@@ -53,7 +53,14 @@ Full schemas and usage in the [main README](https://github.com/hamr0/beeperbox#t
 | `BEEPER_API` | Local Beeper Desktop API base | `http://127.0.0.1:23373` |
 | `BEEPER_TOKEN` | Beeper dev token (Settings → Developers) | — (required) |
 | `MCP_PORT` | MCP HTTP port | `23375` |
-| `MCP_AUTH_TOKEN` | Optional bearer guard on the MCP endpoint | unset (open on loopback) |
+| `MCP_AUTH_TOKEN` | Optional static bearer guard on the MCP endpoint | unset (open on loopback) |
+| `MCP_AUTH_MODE` | HTTP auth mode: `open` \| `static` \| `oauth` \| `either` | auto (`oauth` if issuer set, else `static` if token set) |
+| `MCP_OAUTH_ISSUER` | OAuth issuer / authorization server base URL | unset |
+| `MCP_OAUTH_RESOURCE` | Canonical HTTPS resource identifier advertised via RFC 9728 and required in token `aud` | unset |
+| `MCP_OAUTH_JWKS_URI` | RS256 JWKS URL | `<issuer>/jwks.json` |
+| `MCP_OAUTH_SCOPES` | Scopes advertised in protected-resource metadata | `openid,offline_access` |
+| `MCP_OAUTH_REQUIRED_SCOPES` | Scopes every OAuth access token must contain | `openid` |
+| `MCP_OAUTH_CLIENT_IDS` | Optional comma-separated OAuth client allowlist (`client_id`/`azp`) | unset |
 | `MCP_ALLOWED_HOSTS` | Host/Origin allowlist | `localhost,127.0.0.1,::1` |
 | `MCP_BIND_ADDR` | Interface the MCP server binds | `127.0.0.1` (loopback) |
 | `MCP_TOOL_MODE` | Capability surface: `read-only` \| `notes` \| `labels` \| `read-write` (see [Tool modes](https://github.com/hamr0/beeperbox/blob/master/docs/GUIDE.md#tool-modes--label-scoping)) | `read-write` (legacy `MCP_READ_ONLY=1` ⇒ `read-only`) |

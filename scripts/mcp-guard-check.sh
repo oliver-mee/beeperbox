@@ -17,11 +17,12 @@ IMAGE="${1:?usage: mcp-guard-check.sh <image_ref>}"
 GPB="${GUARD_PORT_BASE:-23373}"
 OPEN=mcp-guard-open
 AUTH=mcp-guard-auth
+OAUTH=mcp-guard-oauth
 RO=mcp-guard-ro
 fail=0
 
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
-cleanup() { docker rm -f "$OPEN" "$AUTH" "$RO" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$OPEN" "$AUTH" "$OAUTH" "$RO" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 chk() { # desc expected actual
@@ -75,6 +76,34 @@ chk "wrong token -> 401" 401 \
 chk "correct token -> 200" 200 \
   "$(code -X POST "$A" -H 'Authorization: Bearer ci-secret' -d '{"jsonrpc":"2.0","id":3,"method":"tools/list"}')"
 
+# ── OAuth discovery + /mcp compatibility ─────────────────────────
+# Use "either" mode so CI can authenticate with the static token while still
+# asserting the OAuth-facing metadata and per-tool security scheme.
+docker run -d --name "$OAUTH" -p $((GPB+6)):23375 \
+  -e MCP_AUTH_MODE=either -e MCP_AUTH_TOKEN=ci-secret \
+  -e MCP_OAUTH_ISSUER=https://auth.example.test \
+  -e MCP_OAUTH_RESOURCE=https://beeper.example.test \
+  -e MCP_OAUTH_REQUIRED_SCOPES=openid \
+  --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
+wait_ready http://127.0.0.1:$((GPB+6))/mcp -H 'Authorization: Bearer ci-secret' \
+  || { echo "FAIL: oauth server never became ready"; docker logs "$OAUTH"; exit 1; }
+O=http://127.0.0.1:$((GPB+6))
+chk "OAuth protected-resource metadata -> 200" 200 \
+  "$(code "$O/.well-known/oauth-protected-resource")"
+oauth_resource=$(curl -s "$O/.well-known/oauth-protected-resource" | jq -r '.resource // empty')
+chk "OAuth resource metadata value" "https://beeper.example.test" "$oauth_resource"
+oauth_challenge=$(curl -s -D - -o /dev/null -X POST "$O/mcp" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^WWW-Authenticate:/{sub(/^WWW-Authenticate:[[:space:]]*/, ""); print}')
+case "$oauth_challenge" in
+  *'resource_metadata="https://beeper.example.test/.well-known/oauth-protected-resource"'*) echo "PASS: OAuth 401 advertises resource metadata" ;;
+  *) echo "FAIL: OAuth 401 missing resource_metadata challenge"; fail=1 ;;
+esac
+oauth_scheme=$(curl -s -X POST "$O/mcp" -H 'Authorization: Bearer ci-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq -r '.result.tools[0].securitySchemes[0].type // empty')
+chk "OAuth tool security scheme" "oauth2" "$oauth_scheme"
+
 # ── read-only mode (MCP_READ_ONLY=1 legacy + MCP_TOOL_MODE) ──────
 # The mutating verbs must be hidden from tools/list AND rejected in
 # tools/call even if a client hardcodes the name; the reads stay available.
@@ -104,7 +133,7 @@ NOTES=mcp-guard-notes
 docker rm -f "$NOTES" >/dev/null 2>&1 || true
 docker run -d --name "$NOTES" -p $((GPB+5)):23375 -e MCP_TOOL_MODE=notes \
   --entrypoint node "$IMAGE" /opt/mcp/server.js >/dev/null
-cleanup() { docker rm -f "$OPEN" "$AUTH" "$RO" "$NOTES" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$OPEN" "$AUTH" "$OAUTH" "$RO" "$NOTES" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 wait_ready http://127.0.0.1:$((GPB+5)) \
   || { echo "FAIL: notes server never became ready"; docker logs "$NOTES"; exit 1; }

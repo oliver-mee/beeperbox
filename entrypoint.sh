@@ -71,9 +71,9 @@ echo "[ok] socat forwarder 0.0.0.0:23380 -> 127.0.0.1:23373"
 # Each process gets its own MCP_AUTH_TOKEN via the launch-line env prefix; the
 # write instance uses a distinct sent-ledger so the read instance (which never
 # writes) can't be confused with it.
-MCP_PORT=23375 MCP_TOOL_MODE="${MCP_TOOL_MODE_READ:-read-only}" MCP_LABEL_ALLOW="${MCP_LABEL_ALLOW_READ:-}" MCP_AUTH_TOKEN="${MCP_READ_TOKEN:-}" node /opt/mcp/server.js &
-echo "[ok] beeperbox-mcp (:23375, mode=${MCP_TOOL_MODE_READ:-read-only}${MCP_LABEL_ALLOW_READ:+, scope=$MCP_LABEL_ALLOW_READ}) on 0.0.0.0:23375"
-MCP_PORT=23376 MCP_TOOL_MODE=read-write MCP_AUTH_TOKEN="${MCP_WRITE_TOKEN:-}" BEEPERBOX_SENT_LEDGER=/root/.config/beeperbox/sent-ledger-write.json node /opt/mcp/server.js &
+MCP_PORT=23375 MCP_TOOL_MODE="${MCP_TOOL_MODE_READ:-read-only}" MCP_LABEL_ALLOW="${MCP_LABEL_ALLOW_READ:-}" MCP_AUTH_TOKEN="${MCP_READ_TOKEN:-}" MCP_AUTH_MODE="${MCP_AUTH_MODE_READ:-}" node /opt/mcp/server.js &
+echo "[ok] beeperbox-mcp (:23375, mode=${MCP_TOOL_MODE_READ:-read-only}${MCP_LABEL_ALLOW_READ:+, scope=$MCP_LABEL_ALLOW_READ}, auth=${MCP_AUTH_MODE_READ:-auto}) on 0.0.0.0:23375"
+MCP_PORT=23376 MCP_TOOL_MODE=read-write MCP_AUTH_MODE=static MCP_AUTH_TOKEN="${MCP_WRITE_TOKEN:-}" BEEPERBOX_SENT_LEDGER=/root/.config/beeperbox/sent-ledger-write.json node /opt/mcp/server.js &
 echo "[ok] beeperbox-mcp (read-write) on 0.0.0.0:23376"
 #   :23377  label-scoped (work agent) — mode via MCP_TOOL_MODE_WORK, chat
 #           filter via MCP_LABEL_ALLOW_WORK (required non-empty: if the token
@@ -83,7 +83,7 @@ if [ -n "${MCP_WORK_TOKEN:-}" ]; then
   if [ -z "${MCP_LABEL_ALLOW_WORK:-}" ]; then
     echo "[!!] MCP_WORK_TOKEN set but MCP_LABEL_ALLOW_WORK empty — work instance NOT started (fail-closed)" >&2
   else
-    MCP_PORT=23377 MCP_TOOL_MODE="${MCP_TOOL_MODE_WORK:-read-only}" MCP_LABEL_ALLOW="${MCP_LABEL_ALLOW_WORK}" MCP_AUTH_TOKEN="${MCP_WORK_TOKEN}" BEEPERBOX_SENT_LEDGER=/root/.config/beeperbox/sent-ledger-work.json node /opt/mcp/server.js &
+    MCP_PORT=23377 MCP_TOOL_MODE="${MCP_TOOL_MODE_WORK:-read-only}" MCP_LABEL_ALLOW="${MCP_LABEL_ALLOW_WORK}" MCP_AUTH_MODE=static MCP_AUTH_TOKEN="${MCP_WORK_TOKEN}" BEEPERBOX_SENT_LEDGER=/root/.config/beeperbox/sent-ledger-work.json node /opt/mcp/server.js &
     echo "[ok] beeperbox-mcp (:23377, mode=${MCP_TOOL_MODE_WORK:-read-only}, scope=${MCP_LABEL_ALLOW_WORK}) on 0.0.0.0:23377"
   fi
 fi

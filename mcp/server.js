@@ -52,6 +52,17 @@ const BIND_ADDR = process.env.MCP_BIND_ADDR || '127.0.0.1';
 // in lite mode the loopback BIND is, because a non-browser client can spoof the
 // Host header past the allowlist.
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
+// Optional OAuth 2.1 resource-server mode for remote MCP clients such as
+// ChatGPT. The authorization server issues RS256 JWT access tokens; this
+// process verifies them locally against its JWKS and never handles passwords.
+const MCP_OAUTH_ISSUER = (process.env.MCP_OAUTH_ISSUER || '').replace(/\/$/, '');
+const MCP_OAUTH_RESOURCE = (process.env.MCP_OAUTH_RESOURCE || '').replace(/\/$/, '');
+const MCP_OAUTH_JWKS_URI = process.env.MCP_OAUTH_JWKS_URI || (MCP_OAUTH_ISSUER ? `${MCP_OAUTH_ISSUER}/jwks.json` : '');
+const MCP_OAUTH_SCOPES = (process.env.MCP_OAUTH_SCOPES || 'openid,offline_access').split(',').map((s) => s.trim()).filter(Boolean);
+const MCP_OAUTH_REQUIRED_SCOPES = (process.env.MCP_OAUTH_REQUIRED_SCOPES || 'openid').split(',').map((s) => s.trim()).filter(Boolean);
+const MCP_OAUTH_CLIENT_IDS = new Set((process.env.MCP_OAUTH_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean));
+const MCP_OAUTH_CLOCK_SKEW_SEC = Math.max(0, parseInt(process.env.MCP_OAUTH_CLOCK_SKEW_SEC || '60', 10) || 0);
+const MCP_AUTH_MODE = String(process.env.MCP_AUTH_MODE || (MCP_OAUTH_ISSUER ? 'oauth' : (MCP_AUTH_TOKEN ? 'static' : 'open'))).trim().toLowerCase();
 const MCP_ALLOWED_HOSTS = new Set(
   (process.env.MCP_ALLOWED_HOSTS || 'localhost,127.0.0.1,::1,[::1]')
     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
@@ -370,8 +381,115 @@ function hostFromHeader(value) {
   return c >= 0 ? h.slice(0, c) : h;
 }
 
-// Returns null when the request may proceed, else { status, message }.
-function httpGuard(req) {
+function timingSafeStringEqual(a, b) {
+  const aa = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function bearerFromRequest(req) {
+  const m = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+  return m ? m[1] : '';
+}
+
+function oauthAuthEnabled() {
+  return MCP_AUTH_MODE === 'oauth' || MCP_AUTH_MODE === 'either';
+}
+
+function oauthProtectedResourceMetadata() {
+  return {
+    resource: MCP_OAUTH_RESOURCE,
+    authorization_servers: [MCP_OAUTH_ISSUER],
+    scopes_supported: MCP_OAUTH_SCOPES,
+  };
+}
+
+function oauthChallenge() {
+  const metadata = MCP_OAUTH_RESOURCE
+    ? `${MCP_OAUTH_RESOURCE}/.well-known/oauth-protected-resource`
+    : '/.well-known/oauth-protected-resource';
+  const scope = MCP_OAUTH_REQUIRED_SCOPES.join(' ');
+  return `Bearer resource_metadata="${metadata}"${scope ? `, scope="${scope}"` : ''}`;
+}
+
+function decodeJwtPart(part) {
+  return JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+}
+
+function tokenScopes(payload) {
+  if (Array.isArray(payload.scp)) return payload.scp.map(String);
+  return String(payload.scope || '').split(/\s+/).filter(Boolean);
+}
+
+let oauthJwksCache = null;
+async function getOAuthJwks() {
+  const now = Date.now();
+  if (oauthJwksCache && now - oauthJwksCache.at < 5 * 60 * 1000) return oauthJwksCache.value;
+  if (!MCP_OAUTH_JWKS_URI) throw new Error('OAuth JWKS URI is not configured');
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 5000);
+  try {
+    const r = await fetch(MCP_OAUTH_JWKS_URI, { signal: ac.signal });
+    if (!r.ok) throw new Error(`JWKS fetch failed: HTTP ${r.status}`);
+    const value = await r.json();
+    if (!Array.isArray(value.keys) || !value.keys.length) throw new Error('JWKS has no keys');
+    oauthJwksCache = { at: now, value };
+    return value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyOAuthAccessToken(token) {
+  if (!MCP_OAUTH_ISSUER || !MCP_OAUTH_RESOURCE) throw new Error('OAuth issuer/resource is not configured');
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) throw new Error('access token is not a JWT');
+  let header;
+  let payload;
+  try {
+    header = decodeJwtPart(parts[0]);
+    payload = decodeJwtPart(parts[1]);
+  } catch {
+    throw new Error('malformed JWT');
+  }
+  if (header.alg !== 'RS256') throw new Error(`unsupported JWT alg: ${header.alg || 'missing'}`);
+
+  const jwks = await getOAuthJwks();
+  const candidates = jwks.keys.filter((k) =>
+    k.kty === 'RSA' && (!header.kid || k.kid === header.kid) && (!k.use || k.use === 'sig'));
+  if (!candidates.length) throw new Error('no matching signing key');
+  const data = Buffer.from(`${parts[0]}.${parts[1]}`);
+  const signature = Buffer.from(parts[2], 'base64url');
+  let verified = false;
+  for (const jwk of candidates) {
+    try {
+      const key = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+      if (crypto.verify('RSA-SHA256', data, key, signature)) {
+        verified = true;
+        break;
+      }
+    } catch { /* try the next matching key */ }
+  }
+  if (!verified) throw new Error('JWT signature verification failed');
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.iss !== MCP_OAUTH_ISSUER) throw new Error('wrong token issuer');
+  if (!Number.isFinite(payload.exp) || payload.exp < now - MCP_OAUTH_CLOCK_SKEW_SEC) throw new Error('token expired');
+  if (Number.isFinite(payload.nbf) && payload.nbf > now + MCP_OAUTH_CLOCK_SKEW_SEC) throw new Error('token not active yet');
+  const audiences = Array.isArray(payload.aud) ? payload.aud.map(String) : [String(payload.aud || '')];
+  if (!audiences.includes(MCP_OAUTH_RESOURCE)) throw new Error('wrong token audience');
+  const scopes = new Set(tokenScopes(payload));
+  for (const scope of MCP_OAUTH_REQUIRED_SCOPES) {
+    if (!scopes.has(scope)) throw new Error(`missing required scope: ${scope}`);
+  }
+  if (MCP_OAUTH_CLIENT_IDS.size && !MCP_OAUTH_CLIENT_IDS.has(String(payload.client_id || payload.azp || ''))) {
+    throw new Error('OAuth client is not allowed');
+  }
+  return payload;
+}
+
+// Returns null when the request may proceed, else { status, message, headers? }.
+async function httpGuard(req) {
   // DNS-rebinding guard: the browser sends the attacker's domain as Host.
   const host = hostFromHeader(req.headers.host);
   if (host && !MCP_ALLOWED_HOSTS.has(host)) {
@@ -387,11 +505,32 @@ function httpGuard(req) {
       return { status: 403, message: `origin not allowed: ${origin}` };
     }
   }
-  // Bearer-token guard: only enforced when a token is configured.
-  if (MCP_AUTH_TOKEN && req.headers.authorization !== `Bearer ${MCP_AUTH_TOKEN}`) {
-    return { status: 401, message: 'unauthorized' };
+
+  if (MCP_AUTH_MODE === 'open') return null;
+  if (!['static', 'oauth', 'either'].includes(MCP_AUTH_MODE)) {
+    return { status: 503, message: `invalid MCP_AUTH_MODE: ${MCP_AUTH_MODE}` };
   }
-  return null;
+
+  const bearer = bearerFromRequest(req);
+  if ((MCP_AUTH_MODE === 'static' || MCP_AUTH_MODE === 'either')
+      && MCP_AUTH_TOKEN && timingSafeStringEqual(bearer, MCP_AUTH_TOKEN)) {
+    return null;
+  }
+
+  if (MCP_AUTH_MODE === 'oauth' || MCP_AUTH_MODE === 'either') {
+    try {
+      await verifyOAuthAccessToken(bearer);
+      return null;
+    } catch {
+      return {
+        status: 401,
+        message: 'unauthorized',
+        headers: { 'WWW-Authenticate': oauthChallenge() },
+      };
+    }
+  }
+
+  return { status: 401, message: 'unauthorized' };
 }
 
 // ─── beeper api helper ────────────────────────────────────────────
@@ -1536,6 +1675,25 @@ function rpcError(code, message) {
   return e;
 }
 
+function toolsForClient() {
+  return TOOLS.filter((t) => ALLOWED_TOOLS.has(t.name)).map((tool) => {
+    const readOnly = GROUP_READ.has(tool.name);
+    const out = {
+      ...tool,
+      annotations: {
+        ...(tool.annotations || {}),
+        readOnlyHint: readOnly,
+        destructiveHint: GROUP_OUTBOUND.has(tool.name),
+        openWorldHint: false,
+      },
+    };
+    if (oauthAuthEnabled()) {
+      out.securitySchemes = [{ type: 'oauth2', scopes: MCP_OAUTH_REQUIRED_SCOPES }];
+    }
+    return out;
+  });
+}
+
 async function handleRequest(req) {
   // Notifications carry no id; the spec says no response is sent.
   const isNotification = req.id === undefined;
@@ -1561,7 +1719,7 @@ async function handleRequest(req) {
         return null;
 
       case 'tools/list':
-        result = { tools: TOOLS.filter((t) => ALLOWED_TOOLS.has(t.name)) };
+        result = { tools: toolsForClient() };
         break;
 
       case 'tools/call': {
@@ -1616,15 +1774,36 @@ async function preflight() {
 // ─── http transport ───────────────────────────────────────────────
 
 function startHttpTransport() {
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
+    let pathname = '/';
+    try { pathname = new URL(req.url || '/', 'http://localhost').pathname; } catch { /* keep / */ }
+
+    const metadataPath = pathname === '/.well-known/oauth-protected-resource'
+      || pathname === '/.well-known/oauth-protected-resource/mcp';
+    if (req.method === 'GET' && metadataPath) {
+      if (!oauthAuthEnabled() || !MCP_OAUTH_ISSUER || !MCP_OAUTH_RESOURCE) {
+        res.writeHead(404).end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' });
+      res.end(JSON.stringify(oauthProtectedResourceMetadata()));
+      return;
+    }
+
+    // Keep / for backwards compatibility with existing clients; /mcp is the
+    // standards-facing Streamable HTTP URL used by ChatGPT and MCP Inspector.
+    if (pathname !== '/' && pathname !== '/mcp') {
+      res.writeHead(404).end();
+      return;
+    }
     if (req.method !== 'POST') {
       res.writeHead(405, { Allow: 'POST' }).end();
       return;
     }
 
-    const denied = httpGuard(req);
+    const denied = await httpGuard(req);
     if (denied) {
-      res.writeHead(denied.status, { 'Content-Type': 'application/json' });
+      res.writeHead(denied.status, { 'Content-Type': 'application/json', ...(denied.headers || {}) });
       res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: denied.message } }));
       return;
     }
@@ -1654,7 +1833,7 @@ function startHttpTransport() {
 
       const response = await handleRequest(parsed);
       if (response === null) {
-        res.writeHead(204).end();
+        res.writeHead(202).end();
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(response));
@@ -1663,10 +1842,13 @@ function startHttpTransport() {
   });
 
   server.listen(PORT, BIND_ADDR, () => {
-    console.log(`[beeperbox-mcp] listening on http://${BIND_ADDR}:${PORT}${BIND_ADDR === '0.0.0.0' ? ' (all interfaces — rely on a loopback publish or set MCP_AUTH_TOKEN)' : ' (loopback only)'}`);
+    console.log(`[beeperbox-mcp] listening on http://${BIND_ADDR}:${PORT} (/mcp + legacy /)`);
     console.log(`[beeperbox-mcp] beeper api: ${BEEPER_API}`);
     console.log(`[beeperbox-mcp] beeper token: ${BEEPER_TOKEN ? 'set' : 'NOT SET (set BEEPER_TOKEN env var)'}`);
-    console.log(`[beeperbox-mcp] http auth: ${MCP_AUTH_TOKEN ? 'required (MCP_AUTH_TOKEN set)' : 'OPEN — set MCP_AUTH_TOKEN to require a bearer token'}`);
+    console.log(`[beeperbox-mcp] http auth mode: ${MCP_AUTH_MODE}${MCP_AUTH_TOKEN ? ' + static token configured' : ''}`);
+    if (oauthAuthEnabled()) {
+      console.log(`[beeperbox-mcp] oauth issuer: ${MCP_OAUTH_ISSUER || 'NOT SET'}; resource: ${MCP_OAUTH_RESOURCE || 'NOT SET'}`);
+    }
     console.log(`[beeperbox-mcp] mode: ${MODE} (${ALLOWED_TOOLS.size}/${TOOLS.length} tools enabled)`);
     if (LABEL_ALLOW.length) console.log(`[beeperbox-mcp] label scope: ${LABEL_ALLOW.join(', ')} (fail-closed; note_to_self exempt)`);
     console.log(`[beeperbox-mcp] allowed hosts: ${[...MCP_ALLOWED_HOSTS].join(', ')}`);
